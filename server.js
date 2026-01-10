@@ -1,391 +1,471 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { openai } from "./openaiClient.js";
-import { requireUID } from "./authMiddleware.js";
-import { googleStartURL, googleHandleCallback } from "./oauthGoogle.js";
+
+import { openaiResponsesCreate } from "./openaiClient.js";
+import { authMiddleware } from "./authMiddleware.js";
 import {
-  gmailListLastEmails,
+  getProviderTokens,
+  getPendingAction,
+  setPendingAction,
+  clearPendingAction,
+} from "./tokenStore.js";
+
+import {
+  googleAuthFromTokens,
+  gmailListLastN,
   gmailSend,
   calendarListEvents,
   calendarCreateEvent,
   calendarDeleteEvent,
 } from "./providerClients.js";
 
-const BUILD = "server.js-v6-speed-tuned-delete-calendar-fixed";
+import { registerGoogleOAuthRoutes } from "./oauthGoogle.js";
+import { registerMicrosoftOAuthRoutes } from "./oauthMicrosoft.js";
+
+const BUILD = process.env.BUILD || "server.js-v7-add-delete-calendar-events";
+const PORT = Number(process.env.PORT || 3000);
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+app.use(authMiddleware);
 
+// ---- Basic routes ----
 app.get("/", (_req, res) => {
-  res.status(200).send("Mindenu API is running. Try /health");
+  res
+    .status(200)
+    .send(
+      `Mindenu API is running. Try /health or /v1/chat. Build: ${BUILD}`
+    );
 });
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, build: BUILD });
 });
 
-/** -------------------------
- * OAuth (Google)
- * ------------------------*/
-app.get("/v1/oauth/google/start", (req, res) => {
-  try {
-    const uid = req.query.uid;
-    const deep_link = req.query.deep_link;
-    const url = googleStartURL({ uid, deep_link });
-    res.redirect(url);
-  } catch (e) {
-    res.status(e.status || 500).send(String(e.message || e));
-  }
-});
+// ---- OAuth routes ----
+registerGoogleOAuthRoutes(app);
+registerMicrosoftOAuthRoutes(app);
 
-app.get("/v1/oauth/google/callback", async (req, res) => {
-  try {
-    const { code, state } = req.query;
-    const { deep_link } = await googleHandleCallback({ code, state });
-
-    // Redirect back to iOS deep link
-    const u = new URL(deep_link);
-    u.searchParams.set("provider", "google");
-    u.searchParams.set("status", "connected");
-    res.redirect(u.toString());
-  } catch (e) {
-    res.status(e.status || 500).send(String(e.message || e));
-  }
-});
-
-/** -------------------------
- * Helpers
- * ------------------------*/
+// ---- Utilities ----
 function nowISO() {
   return new Date().toISOString();
 }
 
-function addDays(d, days) {
-  const x = new Date(d);
-  x.setDate(x.getDate() + days);
-  return x;
+function toISOWithMinutesFromNow(minutes) {
+  const d = new Date(Date.now() + minutes * 60 * 1000);
+  return d.toISOString();
 }
 
-function safeJson(obj) {
+function normalizeConfirm(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (t === "send it" || t === "send") return "send";
+  if (t === "create it" || t === "create") return "create";
+  if (t === "delete it" || t === "delete") return "delete";
+  return null;
+}
+
+function safeJsonParse(s) {
   try {
-    return JSON.stringify(obj);
+    return JSON.parse(s);
   } catch {
-    return String(obj);
+    return null;
   }
 }
 
-/** -------------------------
- * Tool definitions
- * ------------------------*/
-const tools = [
-  {
-    type: "function",
-    name: "list_last_emails",
-    description: "List the last N emails in the user's inbox.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: { maxResults: { type: "number" } },
-      required: [],
-    },
-  },
-  {
-    type: "function",
-    name: "propose_email",
-    description:
-      "Propose an email draft for user confirmation before sending it. Do NOT send it directly.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        provider: { type: "string", enum: ["google"] },
-        to: { type: "string" },
-        subject: { type: "string" },
-        bodyText: { type: "string" },
+// ---- Tool definitions for OpenAI ----
+function buildTools() {
+  return [
+    {
+      type: "function",
+      name: "list_last_emails",
+      description: "List the last N emails from the user's inbox.",
+      parameters: {
+        type: "object",
+        properties: {
+          maxResults: { type: "integer", default: 3 },
+        },
       },
-      required: ["provider", "to", "subject", "bodyText"],
     },
-  },
-  {
-    type: "function",
-    name: "send_email",
-    description:
-      'Send an email that the user has already approved (e.g., user said "Send it").',
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        provider: { type: "string", enum: ["google"] },
-        to: { type: "string" },
-        subject: { type: "string" },
-        bodyText: { type: "string" },
+    {
+      type: "function",
+      name: "draft_email",
+      description:
+        "Create an email draft for the user to approve (does not send).",
+      parameters: {
+        type: "object",
+        properties: {
+          to: { type: "string" },
+          subject: { type: "string" },
+          body: { type: "string" },
+        },
+        required: ["to", "subject", "body"],
       },
-      required: ["provider", "to", "subject", "bodyText"],
     },
-  },
-  {
-    type: "function",
-    name: "list_calendar_next_days",
-    description: "List calendar events for the next X days (default 3).",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: { days: { type: "number" } },
-      required: [],
-    },
-  },
-  {
-    type: "function",
-    name: "propose_calendar_event",
-    description:
-      "Propose a calendar event for user confirmation before creating it. Do NOT create it directly.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        provider: { type: "string", enum: ["google"] },
-        title: { type: "string" },
-        startISO: { type: "string" },
-        endISO: { type: "string" },
-        description: { type: "string" },
-        location: { type: "string" },
-        attendees: { type: "array", items: { type: "string" } },
+    {
+      type: "function",
+      name: "send_email",
+      description: "Send an email (requires user confirmation flow).",
+      parameters: {
+        type: "object",
+        properties: {
+          to: { type: "string" },
+          subject: { type: "string" },
+          body: { type: "string" },
+        },
+        required: ["to", "subject", "body"],
       },
-      required: ["provider", "title", "startISO", "endISO"],
     },
-  },
-  {
-    type: "function",
-    name: "create_calendar_event",
-    description:
-      'Create a calendar event that the user has already approved (e.g., user said "Create it").',
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        provider: { type: "string", enum: ["google"] },
-        title: { type: "string" },
-        startISO: { type: "string" },
-        endISO: { type: "string" },
-        description: { type: "string" },
-        location: { type: "string" },
-        attendees: { type: "array", items: { type: "string" } },
+    {
+      type: "function",
+      name: "list_calendar_events",
+      description:
+        "List calendar events within a time window (ISO strings).",
+      parameters: {
+        type: "object",
+        properties: {
+          timeMinISO: { type: "string" },
+          timeMaxISO: { type: "string" },
+          maxResults: { type: "integer", default: 20 },
+        },
+        required: ["timeMinISO", "timeMaxISO"],
       },
-      required: ["provider", "title", "startISO", "endISO"],
     },
-  },
-  {
-    type: "function",
-    name: "propose_delete_calendar_event",
-    description:
-      "Propose deleting a calendar event for user confirmation before deleting it. Do NOT delete it directly.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        provider: { type: "string", enum: ["google"] },
-        eventId: { type: "string" },
-        title: { type: "string" },
-        startISO: { type: "string" },
+    {
+      type: "function",
+      name: "propose_calendar_event",
+      description:
+        "Propose a calendar event (requires user confirmation before creating).",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string" },
+          description: { type: "string" },
+          location: { type: "string" },
+          startISO: { type: "string" },
+          endISO: { type: "string" },
+          timezone: { type: "string", default: "America/New_York" }
+        },
+        required: ["summary", "startISO", "endISO"],
       },
-      required: ["provider", "eventId"],
     },
-  },
-  {
-    type: "function",
-    name: "delete_calendar_event",
-    description:
-      'Delete a calendar event that the user has already approved (e.g., user said "Delete it").',
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        provider: { type: "string", enum: ["google"] },
-        eventId: { type: "string" },
+    {
+      type: "function",
+      name: "create_calendar_event",
+      description: "Create a calendar event (requires user confirmation flow).",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string" },
+          description: { type: "string" },
+          location: { type: "string" },
+          startISO: { type: "string" },
+          endISO: { type: "string" },
+          timezone: { type: "string", default: "America/New_York" }
+        },
+        required: ["summary", "startISO", "endISO"],
       },
-      required: ["provider", "eventId"],
     },
-  },
-];
+    {
+      type: "function",
+      name: "delete_calendar_event",
+      description:
+        "Delete a calendar event by eventId (requires user confirmation flow).",
+      parameters: {
+        type: "object",
+        properties: {
+          eventId: { type: "string" },
+        },
+        required: ["eventId"],
+      },
+    },
+  ];
+}
 
-/** -------------------------
- * Chat endpoint
- * ------------------------*/
-app.post("/v1/chat", requireUID, async (req, res) => {
-  const uid = req.uid;
-  const userText = (req.body?.text || "").toString();
+// ---- Provider selection ----
+async function getGoogleAuthForUid(uid) {
+  const tokens = await getProviderTokens(uid, "google");
+  if (!tokens?.refresh_token) {
+    return { ok: false, error: "unauthorized", details: "Google not connected." };
+  }
+  const auth = googleAuthFromTokens(tokens);
+  return { ok: true, auth };
+}
 
-  // simple in-memory session (fine for now; production should store per uid)
-  global.__mindenuSessions = global.__mindenuSessions || new Map();
-  const sessions = global.__mindenuSessions;
+// ---- Tool dispatcher ----
+async function dispatchToolCall({ uid, name, args }) {
+  // NOTE: Google only in this version
+  const ga = await getGoogleAuthForUid(uid);
+  if (!ga.ok) return ga;
 
-  const convo = sessions.get(uid) || [];
-  convo.push({ role: "user", content: userText });
+  const auth = ga.auth;
 
-  const system = {
-    role: "system",
-    content:
-      `You are Mindenu, an assistant inside an iPhone app.\n` +
-      `You can read/send emails and manage Google Calendar using tools.\n` +
-      `IMPORTANT:\n` +
-      `- When the user asks to send an email, propose_email first. Only call send_email after user confirms by saying "Send it".\n` +
-      `- When the user asks to create a calendar event, propose_calendar_event first. Only call create_calendar_event after user confirms by saying "Create it".\n` +
-      `- When the user asks to delete a calendar event, propose_delete_calendar_event first. Only call delete_calendar_event after user confirms by saying "Delete it".\n` +
-      `- Always respond with helpful text. Never return an empty response.`,
-  };
+  switch (name) {
+    case "list_last_emails": {
+      const maxResults = Number(args?.maxResults || 3);
+      const emails = await gmailListLastN({ auth, maxResults });
+      return { ok: true, emails };
+    }
 
-  async function callModel(messages) {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages,
+    case "draft_email": {
+      return { ok: true, draft: args };
+    }
+
+    case "send_email": {
+      // Always store pending, require "Send it"
+      await setPendingAction(uid, {
+        type: "send_email",
+        payload: args,
+      });
+      return {
+        ok: true,
+        needs_confirmation: true,
+        instruction: 'Reply with: "Send it" to send, or tell me what to change.',
+        draft: args,
+      };
+    }
+
+    case "list_calendar_events": {
+      const timeMinISO = String(args?.timeMinISO);
+      const timeMaxISO = String(args?.timeMaxISO);
+      const maxResults = Number(args?.maxResults || 20);
+      const events = await calendarListEvents({ auth, timeMinISO, timeMaxISO, maxResults });
+      return { ok: true, events };
+    }
+
+    case "propose_calendar_event": {
+      await setPendingAction(uid, {
+        type: "create_calendar_event",
+        payload: args,
+      });
+      return {
+        ok: true,
+        needs_confirmation: true,
+        instruction: 'Reply with: "Create it" to create the event, or tell me what to change.',
+        proposal: args,
+      };
+    }
+
+    case "create_calendar_event": {
+      await setPendingAction(uid, {
+        type: "create_calendar_event",
+        payload: args,
+      });
+      return {
+        ok: true,
+        needs_confirmation: true,
+        instruction: 'Reply with: "Create it" to create the event, or tell me what to change.',
+        proposal: args,
+      };
+    }
+
+    case "delete_calendar_event": {
+      await setPendingAction(uid, {
+        type: "delete_calendar_event",
+        payload: args,
+      });
+      return {
+        ok: true,
+        needs_confirmation: true,
+        instruction: 'Reply with: "Delete it" to delete, or tell me what to change.',
+        proposal: args,
+      };
+    }
+
+    default:
+      return { ok: false, error: "unknown_tool", details: `No handler for ${name}` };
+  }
+}
+
+// ---- Execute pending action after user confirms ----
+async function executePendingAction(uid, confirmType) {
+  const pending = await getPendingAction(uid);
+  if (!pending) return null;
+
+  if (confirmType === "send" && pending.type === "send_email") {
+    const ga = await getGoogleAuthForUid(uid);
+    if (!ga.ok) return ga;
+
+    const { to, subject, body } = pending.payload || {};
+    const sent = await gmailSend({
+      auth: ga.auth,
+      to,
+      subject,
+      bodyText: body,
+    });
+
+    await clearPendingAction(uid);
+    return {
+      ok: true,
+      message:
+        `✅ Sent.\n\nTo: ${to}\nSubject: ${subject}\n\n(Message id: ${sent.id})`,
+    };
+  }
+
+  if (confirmType === "create" && pending.type === "create_calendar_event") {
+    const ga = await getGoogleAuthForUid(uid);
+    if (!ga.ok) return ga;
+
+    const p = pending.payload || {};
+    const created = await calendarCreateEvent({
+      auth: ga.auth,
+      summary: p.summary,
+      description: p.description,
+      location: p.location,
+      startISO: p.startISO,
+      endISO: p.endISO,
+      timezone: p.timezone || "America/New_York",
+    });
+
+    await clearPendingAction(uid);
+    return {
+      ok: true,
+      message:
+        `✅ Calendar event created.\n\nTitle: ${p.summary}\nStart: ${p.startISO}\nEnd: ${p.endISO}`,
+      event: created,
+    };
+  }
+
+  if (confirmType === "delete" && pending.type === "delete_calendar_event") {
+    const ga = await getGoogleAuthForUid(uid);
+    if (!ga.ok) return ga;
+
+    const { eventId } = pending.payload || {};
+    if (!eventId) {
+      await clearPendingAction(uid);
+      return { ok: false, error: "missing_eventId" };
+    }
+
+    await calendarDeleteEvent({ auth: ga.auth, eventId });
+
+    await clearPendingAction(uid);
+    return {
+      ok: true,
+      message: `✅ Deleted calendar event.\n\nEvent ID: ${eventId}`,
+    };
+  }
+
+  return null;
+}
+
+// ---- Robust tool loop: prevents blank responses ----
+async function runChatWithTools({ uid, userText }) {
+  const tools = buildTools();
+
+  // If user is confirming a pending action, execute immediately
+  const confirm = normalizeConfirm(userText);
+  if (confirm) {
+    const executed = await executePendingAction(uid, confirm);
+    if (executed?.ok) return executed.message;
+    if (executed && executed.ok === false) {
+      return `Error: ${executed.error || "failed"}${executed.details ? `\n${executed.details}` : ""}`;
+    }
+    // If no pending matched, continue to LLM
+  }
+
+  const system = `
+You are Mindenu, a helpful assistant inside an iPhone app.
+You can:
+- read last emails
+- draft/send emails (send requires confirmation phrase "Send it")
+- list calendar events
+- propose/create events (create requires confirmation phrase "Create it")
+- delete events (delete requires confirmation phrase "Delete it")
+
+When you return a draft/proposal, ALWAYS include the exact confirmation instruction.
+
+If you lack required info, ask ONE concise question.
+`;
+
+  let messages = [
+    { role: "system", content: system.trim() },
+    { role: "user", content: userText },
+  ];
+
+  for (let step = 0; step < 5; step++) {
+    const resp = await openaiResponsesCreate({
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      input: messages,
       tools,
       tool_choice: "auto",
-      temperature: 0.2,
     });
-    return resp.choices?.[0]?.message;
-  }
 
-  async function runToolCall(toolCall) {
-    const name = toolCall.function.name;
-    const args = JSON.parse(toolCall.function.arguments || "{}");
+    const assistantText = (resp.output_text || "").trim();
 
-    switch (name) {
-      case "list_last_emails": {
-        const maxResults = Math.max(1, Math.min(10, args.maxResults || 3));
-        const emails = await gmailListLastEmails(uid, maxResults);
-        return { emails };
-      }
-
-      case "propose_email": {
-        return {
-          proposal: {
-            type: "email",
-            provider: "google",
-            to: args.to,
-            subject: args.subject,
-            bodyText: args.bodyText,
-          },
-          instructions:
-            'Reply with: "Send it" to send, or tell me what to change.',
-        };
-      }
-
-      case "send_email": {
-        const r = await gmailSend(uid, {
-          to: args.to,
-          subject: args.subject,
-          bodyText: args.bodyText,
-        });
-        return { sent: true, messageId: r.id };
-      }
-
-      case "list_calendar_next_days": {
-        const days = Math.max(1, Math.min(14, args.days || 3));
-        const timeMinISO = nowISO();
-        const timeMaxISO = addDays(new Date(), days).toISOString();
-        const events = await calendarListEvents(uid, { timeMinISO, timeMaxISO });
-        return { days, events };
-      }
-
-      case "propose_calendar_event": {
-        return {
-          proposal: {
-            type: "calendar_event",
-            provider: "google",
-            title: args.title,
-            startISO: args.startISO,
-            endISO: args.endISO,
-            description: args.description || "",
-            location: args.location || "",
-            attendees: args.attendees || [],
-          },
-          instructions:
-            'Reply with: "Create it" to create the event, or tell me what to change.',
-        };
-      }
-
-      case "create_calendar_event": {
-        const r = await calendarCreateEvent(uid, {
-          title: args.title,
-          startISO: args.startISO,
-          endISO: args.endISO,
-          description: args.description || "",
-          location: args.location || "",
-          attendees: args.attendees || [],
-        });
-        return { created: true, eventId: r.id };
-      }
-
-      case "propose_delete_calendar_event": {
-        return {
-          proposal: {
-            type: "delete_calendar_event",
-            provider: "google",
-            eventId: args.eventId,
-            title: args.title || "",
-            startISO: args.startISO || "",
-          },
-          instructions:
-            'Reply with: "Delete it" to delete this event, or tell me what to change.',
-        };
-      }
-
-      case "delete_calendar_event": {
-        await calendarDeleteEvent(uid, { eventId: args.eventId });
-        return { deleted: true, eventId: args.eventId };
-      }
-
-      default:
-        return { ok: false, error: `Unknown tool: ${name}` };
+    // gather tool calls
+    const toolCalls = [];
+    for (const item of resp.output || []) {
+      if (item.type === "tool_call") toolCalls.push(item);
     }
-  }
 
-  try {
-    // 1) First model call
-    let msg = await callModel([system, ...convo]);
+    console.log(`[chat] openai step=${step + 1} assistantText length: ${assistantText.length}`);
+    console.log(`[chat] functionCalls count: ${toolCalls.length}`);
 
-    // 2) If tool calls exist, run them, then ALWAYS call model again for final text
-    if (msg?.tool_calls?.length) {
-      convo.push({
-        role: "assistant",
-        content: msg.content || "",
-        tool_calls: msg.tool_calls,
-      });
+    // Done: got text and no tool calls
+    if (assistantText && toolCalls.length === 0) {
+      return assistantText;
+    }
 
-      for (const tc of msg.tool_calls) {
-        const toolResult = await runToolCall(tc);
-        convo.push({
+    // If tool calls exist, execute them and continue
+    if (toolCalls.length > 0) {
+      // Add assistant output (tool_call objects) back into messages
+      messages.push({ role: "assistant", content: resp.output });
+
+      for (const tc of toolCalls) {
+        const name = tc.name;
+        const args = tc.arguments ? safeJsonParse(tc.arguments) : {};
+        console.log(`[chat] tool_call -> ${name}`);
+
+        let result;
+        try {
+          result = await dispatchToolCall({ uid, name, args });
+        } catch (e) {
+          result = { ok: false, error: "tool_error", details: String(e?.message || e) };
+        }
+
+        messages.push({
           role: "tool",
-          tool_call_id: tc.id,
-          content: safeJson(toolResult),
+          name,
+          tool_call_id: tc.call_id,
+          content: JSON.stringify(result),
         });
       }
 
-      // Final model response after tools
-      msg = await callModel([system, ...convo]);
+      // Continue loop: model should now produce user-facing text
+      continue;
     }
 
-    const assistantText =
-      (msg?.content || "").trim() ||
-      "✅ Done. (If you expected more detail, tell me what you want next.)";
+    // No text, no tools: prevent blank return
+    return "I didn’t get a response back. Please try again.";
+  }
 
-    convo.push({ role: "assistant", content: assistantText });
-    sessions.set(uid, convo.slice(-40)); // keep last 40
+  return "I hit a tool loop limit. Please try again.";
+}
 
-    res.json({ ok: true, build: BUILD, assistantText });
+// ---- Chat route used by iOS app ----
+app.post("/v1/chat", async (req, res) => {
+  try {
+    const uid = String(req.body?.uid || "");
+    const message = String(req.body?.message || "");
+
+    if (!uid) return res.status(400).json({ ok: false, error: "missing_uid", build: BUILD });
+    if (!message) return res.status(400).json({ ok: false, error: "missing_message", build: BUILD });
+
+    const text = await runChatWithTools({ uid, userText: message });
+
+    return res.json({ ok: true, text, build: BUILD, ts: nowISO() });
   } catch (e) {
-    const status = e.status || 500;
-    res.status(status).json({
+    return res.status(500).json({
       ok: false,
       error: "server_error",
-      details: String(e.message || e),
+      details: String(e?.message || e),
       build: BUILD,
     });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`mindenu-api listening on :${PORT} (${BUILD})`);
 });

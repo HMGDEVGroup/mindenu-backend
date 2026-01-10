@@ -1,32 +1,45 @@
 import { google } from "googleapis";
-import { getTokens } from "./tokenStore.js";
-import { googleOAuthClientFromTokens } from "./oauthGoogle.js";
 
-export async function getGoogleClients(uid) {
-  const tokens = await getTokens({ uid, provider: "google" });
-  if (!tokens) {
-    const err = new Error("Google not connected for this user");
-    err.status = 401;
-    throw err;
-  }
-
-  const auth = googleOAuthClientFromTokens(tokens);
-  const gmail = google.gmail({ version: "v1", auth });
-  const calendar = google.calendar({ version: "v3", auth });
-
-  return { gmail, calendar };
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-export async function gmailListLastEmails(uid, maxResults = 3) {
-  const { gmail } = await getGoogleClients(uid);
+export function getGoogleOAuthClient() {
+  const clientId = requireEnv("GOOGLE_OAUTH_CLIENT_ID");
+  const clientSecret = requireEnv("GOOGLE_OAUTH_CLIENT_SECRET");
+  const redirectUri = requireEnv("GOOGLE_OAUTH_REDIRECT_URI");
+
+  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+}
+
+export function googleAuthFromTokens(tokens) {
+  const oauth2 = getGoogleOAuthClient();
+
+  // tokens should include at least refresh_token
+  oauth2.setCredentials({
+    access_token: tokens?.access_token,
+    refresh_token: tokens?.refresh_token,
+    scope: tokens?.scope,
+    token_type: tokens?.token_type,
+    expiry_date: tokens?.expiry_date,
+  });
+
+  return oauth2;
+}
+
+export async function gmailListLastN({ auth, maxResults = 3 }) {
+  const gmail = google.gmail({ version: "v1", auth });
+
   const list = await gmail.users.messages.list({
     userId: "me",
     maxResults,
-    labelIds: ["INBOX"],
+    q: "in:inbox",
   });
 
-  const ids = list.data.messages?.map((m) => m.id).filter(Boolean) || [];
-  const out = [];
+  const ids = (list.data.messages || []).map((m) => m.id).filter(Boolean);
+  const results = [];
 
   for (const id of ids) {
     const msg = await gmail.users.messages.get({
@@ -37,57 +50,62 @@ export async function gmailListLastEmails(uid, maxResults = 3) {
     });
 
     const headers = msg.data.payload?.headers || [];
-    const getH = (name) =>
-      headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value;
+    const h = (name) =>
+      headers.find((x) => x.name?.toLowerCase() === name.toLowerCase())?.value || "";
 
-    out.push({
+    results.push({
       id,
-      from: getH("From") || "",
-      subject: getH("Subject") || "",
-      date: getH("Date") || "",
+      from: h("From"),
+      subject: h("Subject"),
+      date: h("Date"),
       snippet: msg.data.snippet || "",
     });
   }
 
-  return out;
+  return results;
 }
 
-function toBase64Url(str) {
-  return Buffer.from(str, "utf8")
+export async function gmailSend({
+  auth,
+  to,
+  subject,
+  bodyText,
+  threadId = null,
+}) {
+  const gmail = google.gmail({ version: "v1", auth });
+
+  const lines = [];
+  lines.push(`To: ${to}`);
+  lines.push("Content-Type: text/plain; charset=utf-8");
+  lines.push("MIME-Version: 1.0");
+  lines.push(`Subject: ${subject}`);
+  lines.push("");
+  lines.push(bodyText || "");
+
+  const raw = Buffer.from(lines.join("\r\n"))
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+    .replace(/=+$/, "");
+
+  const res = await gmail.users.messages.send({
+    userId: "me",
+    requestBody: {
+      raw,
+      ...(threadId ? { threadId } : {}),
+    },
+  });
+
+  return { id: res.data.id, threadId: res.data.threadId };
 }
 
-export async function gmailSend(uid, { to, subject, bodyText }) {
-  const { gmail } = await getGoogleClients(uid);
-
-  const raw = [
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    "MIME-Version: 1.0",
-    "Content-Type: text/plain; charset=utf-8",
-    "",
-    bodyText,
-  ].join("\n");
-
-  try {
-    const res = await gmail.users.messages.send({
-      userId: "me",
-      requestBody: { raw: toBase64Url(raw) },
-    });
-    return { id: res.data.id };
-  } catch (e) {
-    const msg = e?.message || String(e);
-    const err = new Error(`Gmail send error: ${msg}`);
-    err.status = 500;
-    throw err;
-  }
-}
-
-export async function calendarListEvents(uid, { timeMinISO, timeMaxISO }) {
-  const { calendar } = await getGoogleClients(uid);
+export async function calendarListEvents({
+  auth,
+  timeMinISO,
+  timeMaxISO,
+  maxResults = 20,
+}) {
+  const calendar = google.calendar({ version: "v3", auth });
 
   const res = await calendar.events.list({
     calendarId: "primary",
@@ -95,40 +113,46 @@ export async function calendarListEvents(uid, { timeMinISO, timeMaxISO }) {
     timeMax: timeMaxISO,
     singleEvents: true,
     orderBy: "startTime",
-    maxResults: 50,
+    maxResults,
   });
 
-  const items = res.data.items || [];
-  return items.map((ev) => ({
-    id: ev.id,
-    title: ev.summary || "(No title)",
-    start: ev.start?.dateTime || ev.start?.date || "",
-    end: ev.end?.dateTime || ev.end?.date || "",
-    location: ev.location || "",
-    description: ev.description || "",
+  return (res.data.items || []).map((e) => ({
+    id: e.id,
+    summary: e.summary,
+    description: e.description,
+    location: e.location,
+    start: e.start?.dateTime || e.start?.date,
+    end: e.end?.dateTime || e.end?.date,
   }));
 }
 
-export async function calendarCreateEvent(uid, { title, startISO, endISO, description, location, attendees }) {
-  const { calendar } = await getGoogleClients(uid);
+export async function calendarCreateEvent({
+  auth,
+  summary,
+  description,
+  location,
+  startISO,
+  endISO,
+  timezone = "America/New_York",
+}) {
+  const calendar = google.calendar({ version: "v3", auth });
 
   const res = await calendar.events.insert({
     calendarId: "primary",
     requestBody: {
-      summary: title,
-      description: description || "",
-      location: location || "",
-      start: { dateTime: startISO },
-      end: { dateTime: endISO },
-      attendees: (attendees || []).map((email) => ({ email })),
+      summary,
+      description,
+      location,
+      start: { dateTime: startISO, timeZone: timezone },
+      end: { dateTime: endISO, timeZone: timezone },
     },
   });
 
-  return { id: res.data.id };
+  return { id: res.data.id, htmlLink: res.data.htmlLink };
 }
 
-export async function calendarDeleteEvent(uid, { eventId }) {
-  const { calendar } = await getGoogleClients(uid);
+export async function calendarDeleteEvent({ auth, eventId }) {
+  const calendar = google.calendar({ version: "v3", auth });
 
   await calendar.events.delete({
     calendarId: "primary",

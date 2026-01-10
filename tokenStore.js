@@ -2,33 +2,54 @@ import firebaseAdmin from "./firebaseAdmin.js";
 
 const db = firebaseAdmin.firestore();
 
-function docRef(uid, provider) {
-  return db.collection("oauth_tokens").doc(`${uid}__${provider}`);
+function userDoc(uid) {
+  if (!uid) throw new Error("Missing uid");
+  return db.collection("users").doc(uid);
 }
 
-export async function saveTokens({ uid, provider, tokens, meta = {} }) {
-  if (!uid) throw new Error("saveTokens: missing uid");
-  if (!provider) throw new Error("saveTokens: missing provider");
+export async function getUser(uid) {
+  const snap = await userDoc(uid).get();
+  return snap.exists ? snap.data() : null;
+}
 
-  await docRef(uid, provider).set(
-    {
-      uid,
-      provider,
-      tokens,
-      meta,
-      updatedAt: firebaseAdmin.firestore.FieldValue.serverTimestamp(),
+export async function setUser(uid, data) {
+  await userDoc(uid).set(data, { merge: true });
+}
+
+export async function getProviderTokens(uid, provider) {
+  const user = await getUser(uid);
+  if (!user) return null;
+  return user?.tokens?.[provider] || null;
+}
+
+export async function setProviderTokens(uid, provider, tokens) {
+  await setUser(uid, {
+    tokens: {
+      [provider]: tokens,
     },
-    { merge: true }
-  );
+    updatedAt: Date.now(),
+  });
 }
 
-export async function getTokens({ uid, provider }) {
-  const snap = await docRef(uid, provider).get();
-  if (!snap.exists) return null;
-  const data = snap.data();
-  return data?.tokens || null;
+export async function clearProviderTokens(uid, provider) {
+  const user = await getUser(uid);
+  const tokens = user?.tokens || {};
+  delete tokens[provider];
+  await setUser(uid, { tokens, updatedAt: Date.now() });
 }
 
-export async function deleteTokens({ uid, provider }) {
-  await docRef(uid, provider).delete();
+export async function setPendingAction(uid, pending) {
+  await setUser(uid, {
+    pendingAction: pending || null,
+    pendingUpdatedAt: Date.now(),
+  });
+}
+
+export async function getPendingAction(uid) {
+  const user = await getUser(uid);
+  return user?.pendingAction || null;
+}
+
+export async function clearPendingAction(uid) {
+  await setPendingAction(uid, null);
 }
