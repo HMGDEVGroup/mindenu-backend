@@ -1,327 +1,411 @@
-// backend-node/server.js
-import "dotenv/config";
-import "./firebaseAdmin.js";
+// server.js (server.js-v7-delete-calendar-tools-fixed)
+// ESM module (package.json should have: "type": "module")
 
 import express from "express";
 import cors from "cors";
 
-import { requireAuth } from "./authMiddleware.js";
-import { googleStart, googleCallback } from "./oauthGoogle.js";
-import { microsoftStart, microsoftCallback } from "./oauthMicrosoft.js";
-import { getProviderTokens } from "./tokenStore.js";
-
+import { firebaseAdmin } from "./firebaseAdmin.js";
 import {
-  googleFetchCalendarEvents,
-  googleCreateCalendarEvent,
-  googleDeleteCalendarEvent, // ✅ NEW
-  googleFetchGmailUnread,
-  googleSendEmail,
-  msFetchCalendarEvents,
-  msCreateCalendarEvent,
-  msDeleteCalendarEvent, // ✅ NEW
-  msFetchMailUnread,
-  msSendEmail,
+  getGoogleEmailLastN,
+  sendGoogleEmail,
+  getGoogleCalendarNextDays,
+  createGoogleCalendarEvent,
+  deleteGoogleCalendarEvent,
+  findGoogleCalendarEventId,
 } from "./providerClients.js";
 
-import { callOpenAI } from "./openaiClient.js";
+import {
+  getUserProviderTokens,
+  setUserProviderTokens,
+  getPendingAction,
+  setPendingAction,
+  clearPendingAction,
+} from "./tokenStore.js";
 
-const BUILD = "server.js-v7-add-delete-calendar-events";
+import { openaiChatWithTools } from "./openaiClient.js";
 
+// --------------------
+// Config
+// --------------------
+const BUILD = "server.js-v7-delete-calendar-tools-fixed";
+const PORT = process.env.PORT || 3000;
+
+// BASE_URL should be your public backend URL in prod, e.g. https://mindenu-api.onrender.com
+// For local dev: http://localhost:3000
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+// --------------------
+// Express
+// --------------------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-/**
- * --------------------
- * Health
- * --------------------
- */
 app.get("/", (_req, res) => {
-  // So the Render "web page" doesn't show Cannot GET /
-  res.status(200).send("mindenu-api OK");
+  res.status(200).send(`mindenu-api up (${BUILD})`);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, build: BUILD }));
-
-/**
- * --------------------
- * OAuth routes
- * --------------------
- */
-app.get("/v1/oauth/google/start", googleStart);
-app.get("/v1/oauth/google/callback", googleCallback);
-
-app.get("/v1/oauth/microsoft/start", microsoftStart);
-app.get("/v1/oauth/microsoft/callback", microsoftCallback);
-
-/**
- * --------------------
- * Connection status
- * --------------------
- */
-app.get("/v1/oauth/status", requireAuth, (req, res) => {
-  const uid = req.user.uid;
-  const google = getProviderTokens(uid, "google") != null;
-  const microsoft = getProviderTokens(uid, "microsoft") != null;
-  res.json({ ok: true, google, microsoft });
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, build: BUILD });
 });
 
-/**
- * --------------------
- * Helpers (Responses API extraction)
- * --------------------
- */
-function extractAssistantText(openaiResponse) {
-  try {
-    const output = openaiResponse?.output;
-    if (!Array.isArray(output)) return "";
-
-    const chunks = [];
-    for (const item of output) {
-      if (item?.type === "message" && item?.role === "assistant" && Array.isArray(item?.content)) {
-        for (const c of item.content) {
-          if (c?.type === "output_text" && typeof c?.text === "string") chunks.push(c.text);
-          if (c?.type === "refusal" && typeof c?.refusal === "string") chunks.push(c.refusal);
-        }
-      }
-    }
-    return chunks.join("\n").trim();
-  } catch {
-    return "";
-  }
-}
-
-function extractFunctionCalls(openaiResponse) {
-  try {
-    const output = openaiResponse?.output;
-    if (!Array.isArray(output)) return [];
-
-    const calls = [];
-    for (const item of output) {
-      if (item?.type === "function_call") {
-        calls.push({
-          name: item?.name,
-          arguments: item?.arguments,
-        });
-      }
-    }
-    return calls;
-  } catch {
-    return [];
-  }
-}
-
-function toResponsesContentParts(role, text) {
-  const safeText = String(text ?? "");
-  if (role === "assistant") return [{ type: "output_text", text: safeText }];
-  return [{ type: "input_text", text: safeText }];
-}
-
-/**
- * --------------------
- * Simple in-memory cache to speed provider fetch
- * (uid+provider -> cached data for N seconds)
- * --------------------
- */
-const providerCache = new Map();
-// key: `${uid}:${provider}` -> { ts, calendarEvents, unreadEmail }
-const CACHE_TTL_MS = Number(process.env.PROVIDER_CACHE_TTL_MS ?? 15_000);
-
-function cacheKey(uid, provider) {
-  return `${uid}:${provider}`;
-}
-
-function getCache(uid, provider) {
-  const k = cacheKey(uid, provider);
-  const v = providerCache.get(k);
-  if (!v) return null;
-  if (Date.now() - v.ts > CACHE_TTL_MS) {
-    providerCache.delete(k);
-    return null;
-  }
+// --------------------
+// Helpers
+// --------------------
+function mustString(v, name) {
+  if (!v || typeof v !== "string") throw new Error(`Missing or invalid ${name}`);
   return v;
 }
 
-function setCache(uid, provider, calendarEvents, unreadEmail) {
-  providerCache.set(cacheKey(uid, provider), {
-    ts: Date.now(),
-    calendarEvents,
-    unreadEmail,
-  });
+function normalizeUid(req) {
+  // Prefer X-UID header (your iOS client can set this), fallback to body.uid.
+  const uid = req.headers["x-uid"] || req.body?.uid || req.query?.uid;
+  return uid ? String(uid) : "";
 }
 
-/**
- * --------------------
- * Chat endpoint
- * --------------------
- */
-app.post("/v1/chat", requireAuth, async (req, res) => {
+function nowISO() {
+  return new Date().toISOString();
+}
+
+function looksLikeConfirm(msg) {
+  const s = (msg || "").trim().toLowerCase();
+  return s === "send it" || s === "create it" || s === "delete it";
+}
+
+function confirmVerb(msg) {
+  const s = (msg || "").trim().toLowerCase();
+  if (s === "send it") return "send_email";
+  if (s === "create it") return "create_calendar_event";
+  if (s === "delete it") return "delete_calendar_event";
+  return "";
+}
+
+// --------------------
+// Tool Schemas (OpenAI tools)
+// TOP-LEVEL name is REQUIRED (you hit tools[0].name before).
+// --------------------
+const tools = [
+  {
+    type: "function",
+    name: "propose_email",
+    description: "Propose an email draft for user confirmation before sending. Do NOT send directly.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        provider: { type: "string", enum: ["google", "microsoft"] },
+        to: { type: "string" },
+        subject: { type: "string" },
+        bodyText: { type: "string" },
+      },
+      required: ["provider", "to", "subject", "bodyText"],
+    },
+  },
+  {
+    type: "function",
+    name: "propose_calendar_event",
+    description: "Propose a calendar event for user confirmation before creating. Do NOT create directly.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        provider: { type: "string", enum: ["google", "microsoft"] },
+        title: { type: "string" },
+        startISO: { type: "string", description: "ISO 8601 date-time string" },
+        endISO: { type: "string", description: "ISO 8601 date-time string" },
+        description: { type: "string" },
+        location: { type: "string" },
+        attendees: { type: "array", items: { type: "string" } },
+      },
+      required: ["provider", "title", "startISO", "endISO"],
+    },
+  },
+  {
+    type: "function",
+    name: "propose_calendar_delete",
+    description:
+      "Propose deletion of a calendar event for user confirmation before deleting. Do NOT delete directly.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        provider: { type: "string", enum: ["google", "microsoft"] },
+        // eventId is best; if not provided, backend will attempt to resolve by title + time.
+        eventId: { type: "string" },
+        title: { type: "string" },
+        startISO: { type: "string", description: "ISO 8601 date-time string" },
+        endISO: { type: "string", description: "ISO 8601 date-time string" },
+      },
+      required: ["provider"],
+    },
+  },
+];
+
+// --------------------
+// Chat Endpoint
+// --------------------
+// Expected payload from iOS:
+// {
+//   uid: "firebaseUid",
+//   provider: "google", // optional
+//   message: "user text",
+//   context: { ...optional } // optional
+// }
+app.post("/v1/chat", async (req, res) => {
   const t0 = Date.now();
-
   try {
-    const uid = req.user.uid;
-    const { messages } = req.body || {};
+    const uid = normalizeUid(req);
+    const userMessage = (req.body?.message || "").toString();
+    if (!uid) return res.status(401).json({ ok: false, error: "unauthorized", details: "Missing uid" });
+    if (!userMessage) return res.status(400).json({ ok: false, error: "bad_request", details: "Missing message" });
 
-    if (!Array.isArray(messages)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "bad_request", details: "messages must be an array" });
-    }
+    // 1) If user is confirming an action, execute it.
+    if (looksLikeConfirm(userMessage)) {
+      const verb = confirmVerb(userMessage);
 
-    // Provider choice
-    const googleTokens = getProviderTokens(uid, "google");
-    const msTokens = getProviderTokens(uid, "microsoft");
-
-    let provider = null;
-    if (googleTokens?.access_token) provider = "google";
-    else if (msTokens?.access_token) provider = "microsoft";
-
-    // Fetch provider context (cached)
-    let calendarEvents = [];
-    let unreadEmail = [];
-    let cacheFresh = false;
-
-    if (provider) {
-      const cached = getCache(uid, provider);
-      if (cached) {
-        calendarEvents = cached.calendarEvents;
-        unreadEmail = cached.unreadEmail;
-        cacheFresh = true;
-      } else {
-        const tfetch0 = Date.now();
-        try {
-          if (provider === "google") {
-            calendarEvents = await googleFetchCalendarEvents(googleTokens.access_token, { days: 3, maxResults: 25 });
-            unreadEmail = await googleFetchGmailUnread(googleTokens.access_token, { max: 3 });
-          } else {
-            calendarEvents = await msFetchCalendarEvents(msTokens.access_token, { days: 3 });
-            unreadEmail = await msFetchMailUnread(msTokens.access_token, { max: 3 });
-          }
-        } catch {
-          calendarEvents = [];
-          unreadEmail = [];
-        }
-        setCache(uid, provider, calendarEvents, unreadEmail);
-        console.log(`[chat] providerFetch cacheFresh=false provider=${provider} ${Date.now() - tfetch0}ms`);
+      const pending = await getPendingAction(uid);
+      if (!pending) {
+        return res.json({
+          ok: true,
+          assistantText: "I don’t have anything pending to confirm. Ask me to draft an email or propose a calendar action first.",
+        });
       }
+
+      if (pending.actionType !== verb) {
+        return res.json({
+          ok: true,
+          assistantText: `I have a pending action (${pending.actionType}), but you replied "${userMessage}". Reply with the matching confirmation: ${
+            pending.actionType === "send_email" ? `"Send it"` : pending.actionType === "create_calendar_event" ? `"Create it"` : `"Delete it"`
+          }.`,
+        });
+      }
+
+      // Execute pending action
+      const execStart = Date.now();
+      if (verb === "send_email") {
+        if (pending.provider !== "google") {
+          return res.status(400).json({ ok: false, error: "not_supported", details: "Only Google provider is implemented for send_email." });
+        }
+        const tokens = await getUserProviderTokens(uid, "google");
+        const result = await sendGoogleEmail(tokens, {
+          to: pending.to,
+          subject: pending.subject,
+          bodyText: pending.bodyText,
+        });
+
+        await clearPendingAction(uid);
+
+        return res.json({
+          ok: true,
+          assistantText: `✅ Sent.\n\nTo: ${pending.to}\nSubject: ${pending.subject}`,
+          debug: { ms: Date.now() - execStart, providerResult: result },
+        });
+      }
+
+      if (verb === "create_calendar_event") {
+        if (pending.provider !== "google") {
+          return res.status(400).json({ ok: false, error: "not_supported", details: "Only Google provider is implemented for create_calendar_event." });
+        }
+        const tokens = await getUserProviderTokens(uid, "google");
+        const created = await createGoogleCalendarEvent(tokens, {
+          title: pending.title,
+          startISO: pending.startISO,
+          endISO: pending.endISO,
+          description: pending.description || "",
+          location: pending.location || "",
+          attendees: pending.attendees || [],
+        });
+
+        await clearPendingAction(uid);
+
+        return res.json({
+          ok: true,
+          assistantText:
+            `✅ Calendar event created.\n\nTitle: ${pending.title}\nStart: ${pending.startISO}\nEnd: ${pending.endISO}`,
+          debug: { ms: Date.now() - execStart, createdId: created?.id },
+        });
+      }
+
+      if (verb === "delete_calendar_event") {
+        if (pending.provider !== "google") {
+          return res.status(400).json({ ok: false, error: "not_supported", details: "Only Google provider is implemented for delete_calendar_event." });
+        }
+        const tokens = await getUserProviderTokens(uid, "google");
+
+        // Ensure we have an eventId, attempt resolve if missing.
+        let eventId = pending.eventId;
+        if (!eventId) {
+          eventId = await findGoogleCalendarEventId(tokens, {
+            title: pending.title,
+            startISO: pending.startISO,
+            endISO: pending.endISO,
+          });
+        }
+
+        if (!eventId) {
+          await clearPendingAction(uid);
+          return res.json({
+            ok: true,
+            assistantText:
+              "I couldn’t uniquely identify the event to delete. Please ask again and include the exact title and time (or ask me to list today’s events first).",
+          });
+        }
+
+        await deleteGoogleCalendarEvent(tokens, { eventId });
+        await clearPendingAction(uid);
+
+        return res.json({
+          ok: true,
+          assistantText: `✅ Deleted calendar event${pending.title ? `: ${pending.title}` : ""}.`,
+          debug: { ms: Date.now() - execStart, eventId },
+        });
+      }
+
+      // Should not happen
+      await clearPendingAction(uid);
+      return res.json({ ok: true, assistantText: "Pending action cleared." });
     }
 
-    if (provider && cacheFresh) {
-      console.log(`[chat] providerFetch cacheFresh=true provider=${provider} 0ms`);
-    }
+    // 2) Otherwise, run the assistant with tools enabled.
+    const tokensGoogle = await getUserProviderTokens(uid, "google").catch(() => null);
 
-    // ✅ Tools (TOP-LEVEL name/description/parameters)
-    const tools = [
-      {
-        type: "function",
-        name: "propose_calendar_event",
-        description: "Propose a calendar event for user confirmation before creating it. Do NOT create it directly.",
-        parameters: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            provider: { type: "string", enum: ["google", "microsoft"] },
-            title: { type: "string" },
-            startISO: { type: "string", description: "ISO 8601 date-time string" },
-            endISO: { type: "string", description: "ISO 8601 date-time string" },
-            description: { type: "string" },
-            location: { type: "string" },
-            attendees: { type: "array", items: { type: "string" } },
-          },
-          required: ["provider", "title", "startISO", "endISO"],
-        },
-      },
-      {
-        type: "function",
-        name: "propose_email",
-        description: "Propose an email draft for user confirmation before sending it. Do NOT send it directly.",
-        parameters: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            provider: { type: "string", enum: ["google", "microsoft"] },
-            to: { type: "string" },
-            subject: { type: "string" },
-            bodyText: { type: "string" },
-          },
-          required: ["provider", "to", "subject", "bodyText"],
-        },
-      },
-      // ✅ NEW: propose delete calendar event
-      {
-        type: "function",
-        name: "propose_delete_calendar_event",
-        description:
-          "Propose deleting a calendar event for user confirmation. Do NOT delete it directly. Include eventId and title and startISO if possible.",
-        parameters: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            provider: { type: "string", enum: ["google", "microsoft"] },
-            eventId: { type: "string", description: "Calendar provider event ID" },
-            title: { type: "string" },
-            startISO: { type: "string", description: "ISO 8601 start time if known" },
-          },
-          required: ["provider", "eventId"],
-        },
-      },
-    ];
+    // Lightweight context (optional)
+    // You can enrich with last emails + calendar when needed; keep minimal for speed.
+    const systemContext = {
+      now: nowISO(),
+      baseUrl: BASE_URL,
+      hasGoogle: !!tokensGoogle,
+    };
 
-    const systemMsg = [
-      "You are Mindenu, a helpful personal assistant.",
-      "You can summarize email and calendar, draft replies, and propose actions.",
-      "",
-      "Hard rules:",
-      "1) NEVER send an email without explicit user confirmation.",
-      "2) NEVER create a calendar event without explicit user confirmation.",
-      "3) NEVER delete a calendar event without explicit user confirmation.",
-      "",
-      "Confirm phrases:",
-      '- To send an email: user says exactly "Send it".',
-      '- To create an event: user says exactly "Create it".',
-      '- To delete an event: user says exactly "Delete it".',
-      "",
-      `Connected provider: ${provider ?? "none"}`,
-      "",
-      "Calendar events (next 3 days):",
-      JSON.stringify(calendarEvents ?? [], null, 2),
-      "",
-      "Unread email (last 3):",
-      JSON.stringify(unreadEmail ?? [], null, 2),
-      "",
-      "Important:",
-      "If the user asks to delete an event, ALWAYS propose using propose_delete_calendar_event and include the correct eventId from the calendar list when possible.",
-    ].join("\n");
-
-    const openaiInput = [
-      { role: "system", content: toResponsesContentParts("system", systemMsg) },
-      ...messages.map((m) => ({
-        role: m.role,
-        content: toResponsesContentParts(m.role, m.text),
-      })),
-    ];
-
-    const tOpenAI0 = Date.now();
-    const out = await callOpenAI({
-      input: openaiInput,
+    const { assistantText, toolCalls } = await openaiChatWithTools({
+      uid,
+      userMessage,
       tools,
+      systemContext,
     });
-    console.log(`[chat] openai ${Date.now() - tOpenAI0}ms total=${Date.now() - t0}ms`);
 
-    const assistantText = extractAssistantText(out);
-    const functionCalls = extractFunctionCalls(out);
+    console.log(`[chat] openai total=${Date.now() - t0}ms`);
+    console.log("[chat] assistantText length:", assistantText?.length ?? 0);
+    console.log("[chat] assistantText preview:", (assistantText || "").slice(0, 220));
+    console.log("[chat] functionCalls count:", toolCalls.length);
+    if (toolCalls.length) {
+      console.log(
+        "[chat] toolCalls names:",
+        toolCalls.map((tc) => tc.name),
+      );
+      console.log(
+        "[chat] toolCalls args:",
+        toolCalls.map((tc) => tc.arguments),
+      );
+    }
 
-    console.log(`[chat] assistantText length: ${assistantText?.length ?? 0}`);
-    console.log(`[chat] assistantText preview: ${(assistantText ?? "").slice(0, 220).replace(/\s+/g, " ")}`);
-    console.log(`[chat] functionCalls count: ${functionCalls.length}`);
+    // 3) If the model called a tool, handle it.
+    if (toolCalls.length > 0) {
+      // Handle the first tool call (you can extend to multiple if you want)
+      const tc = toolCalls[0];
+      const name = tc.name;
+      const args = tc.arguments || {};
 
-    res.json({
+      if (name === "propose_email") {
+        // store pending action for confirmation
+        await setPendingAction(uid, {
+          actionType: "send_email",
+          provider: args.provider,
+          to: args.to,
+          subject: args.subject,
+          bodyText: args.bodyText,
+          createdAt: nowISO(),
+        });
+
+        return res.json({
+          ok: true,
+          assistantText:
+            `Here’s a draft email for your approval:\n\n` +
+            `To: ${args.to}\n` +
+            `Subject: ${args.subject}\n\n` +
+            `${args.bodyText}\n\n` +
+            `Reply with: "Send it" to send, or tell me what to change.`,
+        });
+      }
+
+      if (name === "propose_calendar_event") {
+        await setPendingAction(uid, {
+          actionType: "create_calendar_event",
+          provider: args.provider,
+          title: args.title,
+          startISO: args.startISO,
+          endISO: args.endISO,
+          description: args.description || "",
+          location: args.location || "",
+          attendees: args.attendees || [],
+          createdAt: nowISO(),
+        });
+
+        return res.json({
+          ok: true,
+          assistantText:
+            `Here’s a calendar event proposal for your approval:\n` +
+            `Title: ${args.title}\n` +
+            `Start: ${args.startISO}\n` +
+            `End: ${args.endISO}\n\n` +
+            `Reply with: "Create it" to create the event, or tell me what to change.`,
+        });
+      }
+
+      if (name === "propose_calendar_delete") {
+        // If eventId is absent, we can attempt to resolve later at execution time
+        // but it helps to resolve now too (best UX).
+        let eventId = args.eventId || "";
+        if (!eventId && args.provider === "google" && tokensGoogle) {
+          eventId = await findGoogleCalendarEventId(tokensGoogle, {
+            title: args.title,
+            startISO: args.startISO,
+            endISO: args.endISO,
+          }).catch(() => "");
+        }
+
+        await setPendingAction(uid, {
+          actionType: "delete_calendar_event",
+          provider: args.provider,
+          eventId: eventId || "",
+          title: args.title || "",
+          startISO: args.startISO || "",
+          endISO: args.endISO || "",
+          createdAt: nowISO(),
+        });
+
+        return res.json({
+          ok: true,
+          assistantText:
+            `Here’s a calendar deletion proposal for your approval:\n\n` +
+            `${args.title ? `Title: ${args.title}\n` : ""}` +
+            `${args.startISO ? `Start: ${args.startISO}\n` : ""}` +
+            `${args.endISO ? `End: ${args.endISO}\n` : ""}` +
+            `\nReply with: "Delete it" to delete this event, or tell me what to change.`,
+        });
+      }
+
+      // 🔥 Critical fallback: NEVER return blank assistantText
+      return res.json({
+        ok: true,
+        assistantText:
+          `I tried to run an action (${name}), but the backend doesn't support it yet.\n` +
+          `Check Render logs for toolCalls and add a handler.`,
+        debug: { tool: name, args },
+      });
+    }
+
+    // 4) No tool call -> return assistantText
+    // Ensure not blank
+    const safeText = (assistantText || "").trim();
+    return res.json({
       ok: true,
-      assistantText,
-      functionCalls,
+      assistantText: safeText.length ? safeText : "I didn’t generate a response. Try again with a bit more detail.",
     });
   } catch (err) {
-    res.status(500).json({
+    console.error("[chat] ERROR:", err);
+    return res.status(500).json({
       ok: false,
       error: "server_error",
       details: err?.message || String(err),
@@ -330,153 +414,38 @@ app.post("/v1/chat", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * --------------------
- * Actions (execute only after user confirmation)
- * --------------------
- */
-
-// Create calendar event (after user confirms)
-app.post("/v1/actions/create-event", requireAuth, async (req, res) => {
+// --------------------
+// OPTIONAL: Basic calendar/email endpoints (useful for testing)
+// --------------------
+app.get("/v1/google/emails/last/:n", async (req, res) => {
   try {
-    const uid = req.user.uid;
-    const { provider, title, startISO, endISO, description, location, attendees } = req.body || {};
-
-    if (!provider || !title || !startISO || !endISO) {
-      return res.status(400).json({
-        ok: false,
-        error: "bad_request",
-        details: "provider, title, startISO, endISO are required",
-      });
-    }
-
-    const tokens = getProviderTokens(uid, provider);
-    if (!tokens?.access_token) {
-      return res.status(400).json({
-        ok: false,
-        error: "not_connected",
-        details: `No access token found for provider: ${provider}`,
-      });
-    }
-
-    const payload = { title, startISO, endISO, description, location, attendees };
-
-    let result;
-    if (provider === "google") {
-      result = await googleCreateCalendarEvent(tokens.access_token, payload);
-    } else if (provider === "microsoft") {
-      result = await msCreateCalendarEvent(tokens.access_token, payload);
-    } else {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
-    }
-
-    // cache refresh
-    providerCache.delete(cacheKey(uid, provider));
-
-    res.json({ ok: true, provider, result, build: BUILD });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: "create_event_failed",
-      details: err?.message || String(err),
-      build: BUILD,
-    });
+    const uid = normalizeUid(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "unauthorized", details: "Missing uid" });
+    const n = Math.max(1, Math.min(20, Number(req.params.n || 3)));
+    const tokens = await getUserProviderTokens(uid, "google");
+    const emails = await getGoogleEmailLastN(tokens, n);
+    res.json({ ok: true, emails });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "server_error", details: e?.message || String(e), build: BUILD });
   }
 });
 
-// ✅ NEW: Delete calendar event (after user confirms)
-app.post("/v1/actions/delete-event", requireAuth, async (req, res) => {
+app.get("/v1/google/calendar/next/:days", async (req, res) => {
   try {
-    const uid = req.user.uid;
-    const { provider, eventId } = req.body || {};
-
-    if (!provider || !eventId) {
-      return res.status(400).json({
-        ok: false,
-        error: "bad_request",
-        details: "provider and eventId are required",
-      });
-    }
-
-    const tokens = getProviderTokens(uid, provider);
-    if (!tokens?.access_token) {
-      return res.status(400).json({
-        ok: false,
-        error: "not_connected",
-        details: `No access token found for provider: ${provider}`,
-      });
-    }
-
-    let result;
-    if (provider === "google") {
-      result = await googleDeleteCalendarEvent(tokens.access_token, eventId);
-    } else if (provider === "microsoft") {
-      result = await msDeleteCalendarEvent(tokens.access_token, eventId);
-    } else {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
-    }
-
-    // cache refresh
-    providerCache.delete(cacheKey(uid, provider));
-
-    res.json({ ok: true, provider, result, build: BUILD });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: "delete_event_failed",
-      details: err?.message || String(err),
-      build: BUILD,
-    });
+    const uid = normalizeUid(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "unauthorized", details: "Missing uid" });
+    const days = Math.max(1, Math.min(14, Number(req.params.days || 3)));
+    const tokens = await getUserProviderTokens(uid, "google");
+    const events = await getGoogleCalendarNextDays(tokens, days);
+    res.json({ ok: true, events });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "server_error", details: e?.message || String(e), build: BUILD });
   }
 });
 
-// Send email (after user confirms)
-app.post("/v1/actions/send-email", requireAuth, async (req, res) => {
-  try {
-    const uid = req.user.uid;
-    const { provider, to, subject, bodyText } = req.body || {};
-
-    if (!provider || !to || !subject || !bodyText) {
-      return res.status(400).json({
-        ok: false,
-        error: "bad_request",
-        details: "provider, to, subject, bodyText are required",
-      });
-    }
-
-    const tokens = getProviderTokens(uid, provider);
-    if (!tokens?.access_token) {
-      return res.status(400).json({
-        ok: false,
-        error: "not_connected",
-        details: `No access token found for provider: ${provider}`,
-      });
-    }
-
-    const payload = { to, subject, bodyText };
-
-    let result;
-    if (provider === "google") {
-      result = await googleSendEmail(tokens.access_token, payload);
-    } else if (provider === "microsoft") {
-      result = await msSendEmail(tokens.access_token, payload);
-    } else {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
-    }
-
-    res.json({ ok: true, provider, result, build: BUILD });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: "send_email_failed",
-      details: err?.message || String(err),
-      build: BUILD,
-    });
-  }
+// --------------------
+// Start
+// --------------------
+app.listen(PORT, () => {
+  console.log(`mindenu-api listening on :${PORT} (${BUILD})`);
 });
-
-/**
- * --------------------
- */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`mindenu-api listening on :${PORT} (${BUILD})`));

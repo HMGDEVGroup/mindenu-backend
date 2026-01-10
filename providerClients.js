@@ -1,353 +1,204 @@
-// backend-node/providerClients.js
-import fetch from "node-fetch";
+// providerClients.js
+import { google } from "googleapis";
 
-/**
- * ----------------------------
- * GOOGLE
- * ----------------------------
- */
+function getGoogleOAuthClient(tokens) {
+  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
 
-export async function googleFetchCalendarEvents(accessToken, opts = {}) {
-  // Default: next 3 days (today + 2)
-  const days = Number(opts.days ?? 3);
-  const maxResults = Number(opts.maxResults ?? 25);
-
-  const now = new Date();
-  const timeMin = new Date(now);
-  timeMin.setHours(0, 0, 0, 0);
-
-  const timeMax = new Date(timeMin);
-  timeMax.setDate(timeMax.getDate() + days);
-  timeMax.setHours(23, 59, 59, 999);
-
-  const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
-  url.searchParams.set("timeMin", timeMin.toISOString());
-  url.searchParams.set("timeMax", timeMax.toISOString());
-  url.searchParams.set("singleEvents", "true");
-  url.searchParams.set("orderBy", "startTime");
-  url.searchParams.set("maxResults", String(maxResults));
-
-  const r = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`Google Calendar fetch error: ${r.status} ${text}`);
+  if (!clientId || !clientSecret || !redirectUri) {
+    throw new Error("Missing GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URI");
   }
 
-  const data = await r.json();
-
-  // Normalize a compact structure for the model/UI
-  const items = Array.isArray(data.items) ? data.items : [];
-  return items.map((e) => ({
-    id: e.id,
-    title: e.summary ?? "(no title)",
-    start: e.start?.dateTime ?? e.start?.date ?? null,
-    end: e.end?.dateTime ?? e.end?.date ?? null,
-    location: e.location ?? "",
-    description: e.description ?? "",
-    attendees: Array.isArray(e.attendees) ? e.attendees.map((a) => a.email).filter(Boolean) : [],
-  }));
+  const oauth2 = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  oauth2.setCredentials(tokens);
+  return oauth2;
 }
 
-export async function googleCreateCalendarEvent(accessToken, payload) {
-  const body = {
-    summary: payload.title,
-    description: payload.description ?? "",
-    location: payload.location ?? "",
-    start: { dateTime: payload.startISO },
-    end: { dateTime: payload.endISO },
-  };
+export async function getGoogleEmailLastN(tokens, n = 3) {
+  const auth = getGoogleOAuthClient(tokens);
+  const gmail = google.gmail({ version: "v1", auth });
 
-  if (Array.isArray(payload.attendees) && payload.attendees.length) {
-    body.attendees = payload.attendees.map((email) => ({ email }));
-  }
-
-  const r = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
+  const list = await gmail.users.messages.list({
+    userId: "me",
+    maxResults: n,
+    labelIds: ["INBOX"],
   });
 
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`Google Calendar create error: ${r.status} ${text}`);
-  }
+  const ids = (list.data.messages || []).map((m) => m.id).filter(Boolean);
+  const results = [];
 
-  const e = await r.json();
-  return {
-    id: e.id,
-    title: e.summary ?? payload.title,
-    start: e.start?.dateTime ?? e.start?.date ?? payload.startISO,
-    end: e.end?.dateTime ?? e.end?.date ?? payload.endISO,
-  };
-}
+  for (const id of ids) {
+    const msg = await gmail.users.messages.get({ userId: "me", id, format: "metadata" });
+    const headers = msg.data.payload?.headers || [];
+    const h = (name) => headers.find((x) => x.name?.toLowerCase() === name)?.value || "";
 
-// ✅ NEW: Delete Calendar Event
-export async function googleDeleteCalendarEvent(accessToken, eventId) {
-  if (!eventId) throw new Error("Missing eventId");
-
-  const r = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  // Google returns 204 No Content on success
-  if (r.status === 204) return { ok: true, id: eventId };
-
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`Google Calendar delete error: ${r.status} ${text}`);
-  }
-
-  return { ok: true, id: eventId };
-}
-
-export async function googleFetchGmailUnread(accessToken, opts = {}) {
-  const max = Number(opts.max ?? 3);
-
-  // Gmail list unread messages
-  const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
-  listUrl.searchParams.set("q", "is:unread");
-  listUrl.searchParams.set("maxResults", String(max));
-
-  const listRes = await fetch(listUrl.toString(), {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  if (!listRes.ok) {
-    const text = await listRes.text().catch(() => "");
-    throw new Error(`Gmail unread list error: ${listRes.status} ${text}`);
-  }
-
-  const list = await listRes.json();
-  const msgs = Array.isArray(list.messages) ? list.messages : [];
-
-  // Fetch metadata for each message
-  const out = [];
-  for (const m of msgs) {
-    const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-    if (!msgRes.ok) continue;
-    const msg = await msgRes.json();
-
-    const headers = Array.isArray(msg.payload?.headers) ? msg.payload.headers : [];
-    const h = (name) => headers.find((x) => x.name?.toLowerCase() === name.toLowerCase())?.value ?? "";
-
-    out.push({
-      id: msg.id,
-      threadId: msg.threadId,
-      from: h("From"),
-      subject: h("Subject"),
-      date: h("Date"),
-      snippet: msg.snippet ?? "",
+    results.push({
+      id,
+      from: h("from"),
+      subject: h("subject"),
+      date: h("date"),
+      snippet: msg.data.snippet || "",
     });
   }
 
-  return out;
+  return results;
 }
 
-function base64UrlEncode(str) {
-  return Buffer.from(str, "utf8")
+function makeRawEmail({ to, subject, bodyText }) {
+  const lines = [
+    `To: ${to}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "MIME-Version: 1.0",
+    `Subject: ${subject}`,
+    "",
+    bodyText,
+  ];
+  const message = lines.join("\r\n");
+  return Buffer.from(message)
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
 }
 
-export async function googleSendEmail(accessToken, payload) {
-  const to = payload.to;
-  const subject = payload.subject;
-  const bodyText = payload.bodyText;
+export async function sendGoogleEmail(tokens, { to, subject, bodyText }) {
+  const auth = getGoogleOAuthClient(tokens);
+  const gmail = google.gmail({ version: "v1", auth });
 
-  const raw =
-    `To: ${to}\r\n` +
-    `Subject: ${subject}\r\n` +
-    `Content-Type: text/plain; charset="UTF-8"\r\n` +
-    `Content-Transfer-Encoding: 7bit\r\n` +
-    `\r\n` +
-    `${bodyText}\r\n`;
-
-  const r = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ raw: base64UrlEncode(raw) }),
+  const raw = makeRawEmail({ to, subject, bodyText });
+  const resp = await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw },
   });
 
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`Gmail send error: ${r.status} ${text}`);
-  }
-
-  const data = await r.json();
-  return { id: data.id, threadId: data.threadId };
+  return { id: resp.data.id };
 }
 
-/**
- * ----------------------------
- * MICROSOFT (OPTIONAL)
- * ----------------------------
- * If you’re not using Microsoft yet, these can remain.
- */
+export async function getGoogleCalendarNextDays(tokens, days = 3) {
+  const auth = getGoogleOAuthClient(tokens);
+  const calendar = google.calendar({ version: "v3", auth });
 
-export async function msFetchCalendarEvents(accessToken, opts = {}) {
-  const days = Number(opts.days ?? 3);
+  const timeMin = new Date();
+  const timeMax = new Date();
+  timeMax.setDate(timeMax.getDate() + days);
 
-  const now = new Date();
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-
-  const end = new Date(start);
-  end.setDate(end.getDate() + days);
-  end.setHours(23, 59, 59, 999);
-
-  // Microsoft Graph calendarView
-  const url = new URL("https://graph.microsoft.com/v1.0/me/calendarView");
-  url.searchParams.set("startDateTime", start.toISOString());
-  url.searchParams.set("endDateTime", end.toISOString());
-  url.searchParams.set("$top", "25");
-  url.searchParams.set("$orderby", "start/dateTime");
-
-  const r = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${accessToken}` },
+  const resp = await calendar.events.list({
+    calendarId: "primary",
+    timeMin: timeMin.toISOString(),
+    timeMax: timeMax.toISOString(),
+    singleEvents: true,
+    orderBy: "startTime",
+    maxResults: 50,
   });
 
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`MS Calendar fetch error: ${r.status} ${text}`);
-  }
-
-  const data = await r.json();
-  const items = Array.isArray(data.value) ? data.value : [];
-  return items.map((e) => ({
-    id: e.id,
-    title: e.subject ?? "(no title)",
-    start: e.start?.dateTime ?? null,
-    end: e.end?.dateTime ?? null,
-    location: e.location?.displayName ?? "",
-    description: e.bodyPreview ?? "",
-    attendees: Array.isArray(e.attendees) ? e.attendees.map((a) => a.emailAddress?.address).filter(Boolean) : [],
+  return (resp.data.items || []).map((ev) => ({
+    id: ev.id,
+    title: ev.summary || "(no title)",
+    start: ev.start?.dateTime || ev.start?.date || "",
+    end: ev.end?.dateTime || ev.end?.date || "",
+    location: ev.location || "",
+    description: ev.description || "",
   }));
 }
 
-export async function msCreateCalendarEvent(accessToken, payload) {
+export async function createGoogleCalendarEvent(tokens, { title, startISO, endISO, description, location, attendees }) {
+  const auth = getGoogleOAuthClient(tokens);
+  const calendar = google.calendar({ version: "v3", auth });
+
   const body = {
-    subject: payload.title,
-    body: {
-      contentType: "text",
-      content: payload.description ?? "",
-    },
-    location: { displayName: payload.location ?? "" },
-    start: { dateTime: payload.startISO, timeZone: "UTC" },
-    end: { dateTime: payload.endISO, timeZone: "UTC" },
+    summary: title,
+    description: description || "",
+    location: location || "",
+    start: { dateTime: startISO },
+    end: { dateTime: endISO },
   };
 
-  if (Array.isArray(payload.attendees) && payload.attendees.length) {
-    body.attendees = payload.attendees.map((email) => ({
-      type: "required",
-      emailAddress: { address: email },
-    }));
+  if (Array.isArray(attendees) && attendees.length) {
+    body.attendees = attendees.map((email) => ({ email }));
   }
 
-  const r = await fetch("https://graph.microsoft.com/v1.0/me/events", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
+  const resp = await calendar.events.insert({
+    calendarId: "primary",
+    requestBody: body,
   });
 
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`MS Calendar create error: ${r.status} ${text}`);
-  }
-
-  const e = await r.json();
-  return { id: e.id, title: e.subject ?? payload.title, start: e.start?.dateTime, end: e.end?.dateTime };
+  return { id: resp.data.id };
 }
 
-// ✅ NEW: Delete Calendar Event
-export async function msDeleteCalendarEvent(accessToken, eventId) {
-  if (!eventId) throw new Error("Missing eventId");
+export async function deleteGoogleCalendarEvent(tokens, { eventId }) {
+  if (!eventId) throw new Error("Missing eventId for delete");
+  const auth = getGoogleOAuthClient(tokens);
+  const calendar = google.calendar({ version: "v3", auth });
 
-  const r = await fetch(`https://graph.microsoft.com/v1.0/me/events/${encodeURIComponent(eventId)}`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${accessToken}` },
+  await calendar.events.delete({
+    calendarId: "primary",
+    eventId,
   });
-
-  // Microsoft returns 204 on success
-  if (r.status === 204) return { ok: true, id: eventId };
-
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`MS Calendar delete error: ${r.status} ${text}`);
-  }
-
-  return { ok: true, id: eventId };
-}
-
-export async function msFetchMailUnread(accessToken, opts = {}) {
-  const max = Number(opts.max ?? 3);
-
-  const url = new URL("https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages");
-  url.searchParams.set("$top", String(max));
-  url.searchParams.set("$select", "id,subject,from,receivedDateTime,bodyPreview,isRead");
-  url.searchParams.set("$orderby", "receivedDateTime desc");
-  url.searchParams.set("$filter", "isRead eq false");
-
-  const r = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`MS Mail unread error: ${r.status} ${text}`);
-  }
-
-  const data = await r.json();
-  const items = Array.isArray(data.value) ? data.value : [];
-  return items.map((m) => ({
-    id: m.id,
-    from: m.from?.emailAddress?.address ?? "",
-    subject: m.subject ?? "",
-    date: m.receivedDateTime ?? "",
-    snippet: m.bodyPreview ?? "",
-  }));
-}
-
-export async function msSendEmail(accessToken, payload) {
-  const body = {
-    message: {
-      subject: payload.subject,
-      body: { contentType: "Text", content: payload.bodyText },
-      toRecipients: [{ emailAddress: { address: payload.to } }],
-    },
-    saveToSentItems: "true",
-  };
-
-  const r = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`MS sendMail error: ${r.status} ${text}`);
-  }
 
   return { ok: true };
+}
+
+// Best-effort resolver: match by title and (optionally) start time within the day
+export async function findGoogleCalendarEventId(tokens, { title, startISO, endISO }) {
+  if (!title && !startISO) return "";
+
+  const auth = getGoogleOAuthClient(tokens);
+  const calendar = google.calendar({ version: "v3", auth });
+
+  // Build a time window to search:
+  // - if startISO present: search +/- 1 day around it
+  // - else: search next 7 days
+  let timeMin = new Date();
+  let timeMax = new Date();
+  if (startISO) {
+    const s = new Date(startISO);
+    timeMin = new Date(s.getTime() - 24 * 60 * 60 * 1000);
+    timeMax = new Date(s.getTime() + 24 * 60 * 60 * 1000);
+  } else {
+    timeMax.setDate(timeMax.getDate() + 7);
+  }
+
+  const resp = await calendar.events.list({
+    calendarId: "primary",
+    timeMin: timeMin.toISOString(),
+    timeMax: timeMax.toISOString(),
+    singleEvents: true,
+    orderBy: "startTime",
+    maxResults: 50,
+    q: title || undefined,
+  });
+
+  const items = resp.data.items || [];
+
+  // Try exact-ish match
+  const norm = (s) => (s || "").trim().toLowerCase();
+  const wantTitle = norm(title);
+
+  // If startISO is provided, match closest start time
+  if (startISO) {
+    const wantStart = new Date(startISO).getTime();
+    let best = null;
+    for (const ev of items) {
+      const evTitle = norm(ev.summary);
+      const evStartStr = ev.start?.dateTime || ev.start?.date;
+      if (!evStartStr) continue;
+      const evStart = new Date(evStartStr).getTime();
+
+      // title match if provided
+      if (wantTitle && evTitle !== wantTitle) continue;
+
+      const dist = Math.abs(evStart - wantStart);
+      if (!best || dist < best.dist) best = { id: ev.id, dist };
+    }
+    return best?.id || "";
+  }
+
+  // Otherwise first title match
+  if (wantTitle) {
+    const hit = items.find((ev) => norm(ev.summary) === wantTitle);
+    return hit?.id || "";
+  }
+
+  return "";
 }
