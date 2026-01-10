@@ -1,13 +1,13 @@
-// firebaseAdmin.js
 import admin from "firebase-admin";
 
-if (!admin.apps.length) {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+function initAdmin() {
+  if (admin.apps.length) return admin;
 
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (!raw) {
-    throw new Error(
-      "Missing FIREBASE_SERVICE_ACCOUNT_JSON in environment. Add it in Render -> Environment."
-    );
+    console.warn("[firebase] FIREBASE_SERVICE_ACCOUNT_JSON is missing");
+    admin.initializeApp(); // fallback (won't work on Render unless running on GCP)
+    return admin;
   }
 
   let serviceAccount;
@@ -15,20 +15,16 @@ if (!admin.apps.length) {
     serviceAccount = JSON.parse(raw);
   } catch (e) {
     throw new Error(
-      "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON. Re-paste the ENTIRE JSON exactly as downloaded."
+      "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON. Paste the entire service account JSON file contents."
     );
-  }
-
-  // Important: Render sometimes stores actual newlines; Firebase expects \n inside private_key
-  if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
-    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
   }
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 
-  console.log("[firebaseAdmin] initialized with service account:", serviceAccount.project_id);
+  return admin;
 }
 
-export default admin;
+export const firebaseAdmin = initAdmin();
+export default firebaseAdmin;
