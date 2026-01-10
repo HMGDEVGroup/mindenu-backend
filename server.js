@@ -1,471 +1,303 @@
-import "dotenv/config";
+// server.js (ESM)
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
+import fetch from "node-fetch";
 
-import { openaiResponsesCreate } from "./openaiClient.js";
-import { authMiddleware } from "./authMiddleware.js";
+import firebaseAdmin from "./firebaseAdmin.js";
 import {
-  getProviderTokens,
-  getPendingAction,
-  setPendingAction,
-  clearPendingAction,
-} from "./tokenStore.js";
-
-import {
-  googleAuthFromTokens,
-  gmailListLastN,
-  gmailSend,
-  calendarListEvents,
-  calendarCreateEvent,
-  calendarDeleteEvent,
+  verifyFirebaseBearer,
+  getGoogleCalendarClientForUid,
+  buildGoogleOAuthClient,
+  saveGoogleTokens,
+  getGoogleTokens,
 } from "./providerClients.js";
 
-import { registerGoogleOAuthRoutes } from "./oauthGoogle.js";
-import { registerMicrosoftOAuthRoutes } from "./oauthMicrosoft.js";
-
-const BUILD = process.env.BUILD || "server.js-v7-add-delete-calendar-events";
-const PORT = Number(process.env.PORT || 3000);
+dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
-app.use(authMiddleware);
 
-// ---- Basic routes ----
-app.get("/", (_req, res) => {
+const BUILD = process.env.BUILD || "server.js-v7-add-delete-calendar-events";
+const PORT = process.env.PORT || 3000;
+
+function jsonError(res, code, error, details) {
+  const payload = { ok: false, error, build: BUILD };
+  if (details) payload.details = details;
+  return res.status(code).json(payload);
+}
+
+app.get("/", (req, res) => {
   res
     .status(200)
-    .send(
-      `Mindenu API is running. Try /health or /v1/chat. Build: ${BUILD}`
-    );
+    .send(`Mindenu API is running. Try /health or /v1/chat. Build: ${BUILD}`);
 });
 
-app.get("/health", (_req, res) => {
+app.get("/health", (req, res) => {
   res.json({ ok: true, build: BUILD });
 });
 
-// ---- OAuth routes ----
-registerGoogleOAuthRoutes(app);
-registerMicrosoftOAuthRoutes(app);
-
-// ---- Utilities ----
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function toISOWithMinutesFromNow(minutes) {
-  const d = new Date(Date.now() + minutes * 60 * 1000);
-  return d.toISOString();
-}
-
-function normalizeConfirm(text) {
-  const t = (text || "").trim().toLowerCase();
-  if (t === "send it" || t === "send") return "send";
-  if (t === "create it" || t === "create") return "create";
-  if (t === "delete it" || t === "delete") return "delete";
-  return null;
-}
-
-function safeJsonParse(s) {
+// ---------- Auth middleware ----------
+async function requireAuth(req, res, next) {
   try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
-
-// ---- Tool definitions for OpenAI ----
-function buildTools() {
-  return [
-    {
-      type: "function",
-      name: "list_last_emails",
-      description: "List the last N emails from the user's inbox.",
-      parameters: {
-        type: "object",
-        properties: {
-          maxResults: { type: "integer", default: 3 },
-        },
-      },
-    },
-    {
-      type: "function",
-      name: "draft_email",
-      description:
-        "Create an email draft for the user to approve (does not send).",
-      parameters: {
-        type: "object",
-        properties: {
-          to: { type: "string" },
-          subject: { type: "string" },
-          body: { type: "string" },
-        },
-        required: ["to", "subject", "body"],
-      },
-    },
-    {
-      type: "function",
-      name: "send_email",
-      description: "Send an email (requires user confirmation flow).",
-      parameters: {
-        type: "object",
-        properties: {
-          to: { type: "string" },
-          subject: { type: "string" },
-          body: { type: "string" },
-        },
-        required: ["to", "subject", "body"],
-      },
-    },
-    {
-      type: "function",
-      name: "list_calendar_events",
-      description:
-        "List calendar events within a time window (ISO strings).",
-      parameters: {
-        type: "object",
-        properties: {
-          timeMinISO: { type: "string" },
-          timeMaxISO: { type: "string" },
-          maxResults: { type: "integer", default: 20 },
-        },
-        required: ["timeMinISO", "timeMaxISO"],
-      },
-    },
-    {
-      type: "function",
-      name: "propose_calendar_event",
-      description:
-        "Propose a calendar event (requires user confirmation before creating).",
-      parameters: {
-        type: "object",
-        properties: {
-          summary: { type: "string" },
-          description: { type: "string" },
-          location: { type: "string" },
-          startISO: { type: "string" },
-          endISO: { type: "string" },
-          timezone: { type: "string", default: "America/New_York" }
-        },
-        required: ["summary", "startISO", "endISO"],
-      },
-    },
-    {
-      type: "function",
-      name: "create_calendar_event",
-      description: "Create a calendar event (requires user confirmation flow).",
-      parameters: {
-        type: "object",
-        properties: {
-          summary: { type: "string" },
-          description: { type: "string" },
-          location: { type: "string" },
-          startISO: { type: "string" },
-          endISO: { type: "string" },
-          timezone: { type: "string", default: "America/New_York" }
-        },
-        required: ["summary", "startISO", "endISO"],
-      },
-    },
-    {
-      type: "function",
-      name: "delete_calendar_event",
-      description:
-        "Delete a calendar event by eventId (requires user confirmation flow).",
-      parameters: {
-        type: "object",
-        properties: {
-          eventId: { type: "string" },
-        },
-        required: ["eventId"],
-      },
-    },
-  ];
-}
-
-// ---- Provider selection ----
-async function getGoogleAuthForUid(uid) {
-  const tokens = await getProviderTokens(uid, "google");
-  if (!tokens?.refresh_token) {
-    return { ok: false, error: "unauthorized", details: "Google not connected." };
-  }
-  const auth = googleAuthFromTokens(tokens);
-  return { ok: true, auth };
-}
-
-// ---- Tool dispatcher ----
-async function dispatchToolCall({ uid, name, args }) {
-  // NOTE: Google only in this version
-  const ga = await getGoogleAuthForUid(uid);
-  if (!ga.ok) return ga;
-
-  const auth = ga.auth;
-
-  switch (name) {
-    case "list_last_emails": {
-      const maxResults = Number(args?.maxResults || 3);
-      const emails = await gmailListLastN({ auth, maxResults });
-      return { ok: true, emails };
-    }
-
-    case "draft_email": {
-      return { ok: true, draft: args };
-    }
-
-    case "send_email": {
-      // Always store pending, require "Send it"
-      await setPendingAction(uid, {
-        type: "send_email",
-        payload: args,
-      });
-      return {
-        ok: true,
-        needs_confirmation: true,
-        instruction: 'Reply with: "Send it" to send, or tell me what to change.',
-        draft: args,
-      };
-    }
-
-    case "list_calendar_events": {
-      const timeMinISO = String(args?.timeMinISO);
-      const timeMaxISO = String(args?.timeMaxISO);
-      const maxResults = Number(args?.maxResults || 20);
-      const events = await calendarListEvents({ auth, timeMinISO, timeMaxISO, maxResults });
-      return { ok: true, events };
-    }
-
-    case "propose_calendar_event": {
-      await setPendingAction(uid, {
-        type: "create_calendar_event",
-        payload: args,
-      });
-      return {
-        ok: true,
-        needs_confirmation: true,
-        instruction: 'Reply with: "Create it" to create the event, or tell me what to change.',
-        proposal: args,
-      };
-    }
-
-    case "create_calendar_event": {
-      await setPendingAction(uid, {
-        type: "create_calendar_event",
-        payload: args,
-      });
-      return {
-        ok: true,
-        needs_confirmation: true,
-        instruction: 'Reply with: "Create it" to create the event, or tell me what to change.',
-        proposal: args,
-      };
-    }
-
-    case "delete_calendar_event": {
-      await setPendingAction(uid, {
-        type: "delete_calendar_event",
-        payload: args,
-      });
-      return {
-        ok: true,
-        needs_confirmation: true,
-        instruction: 'Reply with: "Delete it" to delete, or tell me what to change.',
-        proposal: args,
-      };
-    }
-
-    default:
-      return { ok: false, error: "unknown_tool", details: `No handler for ${name}` };
-  }
-}
-
-// ---- Execute pending action after user confirms ----
-async function executePendingAction(uid, confirmType) {
-  const pending = await getPendingAction(uid);
-  if (!pending) return null;
-
-  if (confirmType === "send" && pending.type === "send_email") {
-    const ga = await getGoogleAuthForUid(uid);
-    if (!ga.ok) return ga;
-
-    const { to, subject, body } = pending.payload || {};
-    const sent = await gmailSend({
-      auth: ga.auth,
-      to,
-      subject,
-      bodyText: body,
-    });
-
-    await clearPendingAction(uid);
-    return {
-      ok: true,
-      message:
-        `✅ Sent.\n\nTo: ${to}\nSubject: ${subject}\n\n(Message id: ${sent.id})`,
-    };
-  }
-
-  if (confirmType === "create" && pending.type === "create_calendar_event") {
-    const ga = await getGoogleAuthForUid(uid);
-    if (!ga.ok) return ga;
-
-    const p = pending.payload || {};
-    const created = await calendarCreateEvent({
-      auth: ga.auth,
-      summary: p.summary,
-      description: p.description,
-      location: p.location,
-      startISO: p.startISO,
-      endISO: p.endISO,
-      timezone: p.timezone || "America/New_York",
-    });
-
-    await clearPendingAction(uid);
-    return {
-      ok: true,
-      message:
-        `✅ Calendar event created.\n\nTitle: ${p.summary}\nStart: ${p.startISO}\nEnd: ${p.endISO}`,
-      event: created,
-    };
-  }
-
-  if (confirmType === "delete" && pending.type === "delete_calendar_event") {
-    const ga = await getGoogleAuthForUid(uid);
-    if (!ga.ok) return ga;
-
-    const { eventId } = pending.payload || {};
-    if (!eventId) {
-      await clearPendingAction(uid);
-      return { ok: false, error: "missing_eventId" };
-    }
-
-    await calendarDeleteEvent({ auth: ga.auth, eventId });
-
-    await clearPendingAction(uid);
-    return {
-      ok: true,
-      message: `✅ Deleted calendar event.\n\nEvent ID: ${eventId}`,
-    };
-  }
-
-  return null;
-}
-
-// ---- Robust tool loop: prevents blank responses ----
-async function runChatWithTools({ uid, userText }) {
-  const tools = buildTools();
-
-  // If user is confirming a pending action, execute immediately
-  const confirm = normalizeConfirm(userText);
-  if (confirm) {
-    const executed = await executePendingAction(uid, confirm);
-    if (executed?.ok) return executed.message;
-    if (executed && executed.ok === false) {
-      return `Error: ${executed.error || "failed"}${executed.details ? `\n${executed.details}` : ""}`;
-    }
-    // If no pending matched, continue to LLM
-  }
-
-  const system = `
-You are Mindenu, a helpful assistant inside an iPhone app.
-You can:
-- read last emails
-- draft/send emails (send requires confirmation phrase "Send it")
-- list calendar events
-- propose/create events (create requires confirmation phrase "Create it")
-- delete events (delete requires confirmation phrase "Delete it")
-
-When you return a draft/proposal, ALWAYS include the exact confirmation instruction.
-
-If you lack required info, ask ONE concise question.
-`;
-
-  let messages = [
-    { role: "system", content: system.trim() },
-    { role: "user", content: userText },
-  ];
-
-  for (let step = 0; step < 5; step++) {
-    const resp = await openaiResponsesCreate({
-      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-      input: messages,
-      tools,
-      tool_choice: "auto",
-    });
-
-    const assistantText = (resp.output_text || "").trim();
-
-    // gather tool calls
-    const toolCalls = [];
-    for (const item of resp.output || []) {
-      if (item.type === "tool_call") toolCalls.push(item);
-    }
-
-    console.log(`[chat] openai step=${step + 1} assistantText length: ${assistantText.length}`);
-    console.log(`[chat] functionCalls count: ${toolCalls.length}`);
-
-    // Done: got text and no tool calls
-    if (assistantText && toolCalls.length === 0) {
-      return assistantText;
-    }
-
-    // If tool calls exist, execute them and continue
-    if (toolCalls.length > 0) {
-      // Add assistant output (tool_call objects) back into messages
-      messages.push({ role: "assistant", content: resp.output });
-
-      for (const tc of toolCalls) {
-        const name = tc.name;
-        const args = tc.arguments ? safeJsonParse(tc.arguments) : {};
-        console.log(`[chat] tool_call -> ${name}`);
-
-        let result;
-        try {
-          result = await dispatchToolCall({ uid, name, args });
-        } catch (e) {
-          result = { ok: false, error: "tool_error", details: String(e?.message || e) };
-        }
-
-        messages.push({
-          role: "tool",
-          name,
-          tool_call_id: tc.call_id,
-          content: JSON.stringify(result),
-        });
-      }
-
-      // Continue loop: model should now produce user-facing text
-      continue;
-    }
-
-    // No text, no tools: prevent blank return
-    return "I didn’t get a response back. Please try again.";
-  }
-
-  return "I hit a tool loop limit. Please try again.";
-}
-
-// ---- Chat route used by iOS app ----
-app.post("/v1/chat", async (req, res) => {
-  try {
-    const uid = String(req.body?.uid || "");
-    const message = String(req.body?.message || "");
-
-    if (!uid) return res.status(400).json({ ok: false, error: "missing_uid", build: BUILD });
-    if (!message) return res.status(400).json({ ok: false, error: "missing_message", build: BUILD });
-
-    const text = await runChatWithTools({ uid, userText: message });
-
-    return res.json({ ok: true, text, build: BUILD, ts: nowISO() });
+    const { uid } = await verifyFirebaseBearer(req);
+    req.uid = uid;
+    next();
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: "server_error",
-      details: String(e?.message || e),
+    return jsonError(res, e.status || 401, e.message, e.details);
+  }
+}
+
+// ---------- OAuth status ----------
+app.get("/v1/oauth/status", requireAuth, async (req, res) => {
+  try {
+    const googleTokens = await getGoogleTokens(req.uid);
+    return res.json({
+      ok: true,
       build: BUILD,
+      google: { connected: !!googleTokens },
+      microsoft: { connected: false },
     });
+  } catch (e) {
+    return jsonError(res, 500, "server_error", e?.message || String(e));
   }
 });
 
-// ---- Start ----
+// ---------- Google OAuth begin ----------
+app.get("/v1/oauth/google/start", requireAuth, async (req, res) => {
+  try {
+    const oauth2 = buildGoogleOAuthClient();
+
+    // You can override scopes using env GOOGLE_SCOPES (space-separated)
+    const scopes =
+      (process.env.GOOGLE_SCOPES || "")
+        .split(" ")
+        .map((s) => s.trim())
+        .filter(Boolean) || [];
+
+    const finalScopes =
+      scopes.length > 0
+        ? scopes
+        : [
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+            "https://www.googleapis.com/auth/calendar",
+          ];
+
+    const url = oauth2.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: finalScopes,
+      state: req.uid, // IMPORTANT: lets callback know which uid
+    });
+
+    return res.json({ ok: true, url, build: BUILD });
+  } catch (e) {
+    return jsonError(res, 500, "oauth_start_failed", e?.message || String(e));
+  }
+});
+
+// ---------- Google OAuth callback ----------
+app.get("/v1/oauth/google/callback", async (req, res) => {
+  try {
+    const code = req.query.code;
+    const uid = req.query.state; // set in /start
+
+    if (!code) return res.status(400).send("Google OAuth callback error: missing_code");
+    if (!uid) return res.status(400).send("Google OAuth callback error: missing_state_uid");
+
+    const oauth2 = buildGoogleOAuthClient();
+    const { tokens } = await oauth2.getToken(code);
+
+    await saveGoogleTokens(uid, tokens);
+
+    return res.status(200).send("Google connected. You can return to the app.");
+  } catch (e) {
+    return res
+      .status(500)
+      .send(`Google OAuth callback error: ${e?.message || String(e)}`);
+  }
+});
+
+// ---------- OpenAI helper ----------
+async function callOpenAIChat({ userText, messages }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return { assistantText: "Server is missing OPENAI_API_KEY." };
+  }
+
+  // Convert your {role,text} to OpenAI {role,content}
+  const openAiMessages = [];
+
+  // Optional system prompt
+  openAiMessages.push({
+    role: "system",
+    content:
+      "You are Mindenu, a helpful assistant. Keep answers concise and actionable.",
+  });
+
+  if (Array.isArray(messages) && messages.length > 0) {
+    for (const m of messages) {
+      const role = m?.role;
+      const text = m?.text ?? m?.content;
+      if (!role || !text) continue;
+      openAiMessages.push({ role, content: String(text) });
+    }
+  } else if (userText) {
+    openAiMessages.push({ role: "user", content: String(userText) });
+  }
+
+  const payload = {
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    messages: openAiMessages,
+    temperature: 0.2,
+  };
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await r.json().catch(() => ({}));
+
+  if (!r.ok) {
+    return {
+      assistantText:
+        data?.error?.message ||
+        `OpenAI error HTTP ${r.status}: ${JSON.stringify(data)}`,
+      raw: data,
+    };
+  }
+
+  const assistantText =
+    data?.choices?.[0]?.message?.content ??
+    data?.choices?.[0]?.text ??
+    "";
+
+  return { assistantText, raw: data };
+}
+
+// ---------- Calendar helper ----------
+async function listCalendarEvents(calendar, timeMinISO, timeMaxISO) {
+  const resp = await calendar.events.list({
+    calendarId: "primary",
+    timeMin: timeMinISO,
+    timeMax: timeMaxISO,
+    singleEvents: true,
+    orderBy: "startTime",
+    maxResults: 50,
+  });
+
+  const items = resp?.data?.items || [];
+  return items.map((ev) => ({
+    id: ev.id,
+    summary: ev.summary || "(No title)",
+    start: ev.start?.dateTime || ev.start?.date,
+    end: ev.end?.dateTime || ev.end?.date,
+  }));
+}
+
+// ---------- Chat ----------
+app.post("/v1/chat", requireAuth, async (req, res) => {
+  try {
+    // ✅ Accept BOTH formats:
+    const body = req.body || {};
+    const uid = req.uid; // extracted from Firebase token
+
+    // Prefer explicit "message" if present, else take last user in "messages"
+    let userText = typeof body.message === "string" ? body.message.trim() : "";
+
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+
+    if (!userText && messages.length > 0) {
+      const lastUser = [...messages].reverse().find((m) => m?.role === "user" && m?.text);
+      userText = lastUser?.text?.trim() || "";
+    }
+
+    if (!userText) {
+      return jsonError(res, 400, "missing_message");
+    }
+
+    // If question is clearly calendar-related, attempt calendar
+    const isCalendarAsk = /calendar|schedule|events|tomorrow|today/i.test(userText);
+
+    if (isCalendarAsk) {
+      const calendar = await getGoogleCalendarClientForUid(uid);
+      if (!calendar) {
+        return res.json({
+          ok: true,
+          build: BUILD,
+          assistantText:
+            "Google isn’t connected on the server for this account. Tap Google Connected in the app to re-link, then try again.",
+          functionCalls: [],
+        });
+      }
+
+      // Minimal “tomorrow” handler (example)
+      if (/tomorrow/i.test(userText)) {
+        const now = new Date();
+        const start = new Date(now);
+        start.setDate(start.getDate() + 1);
+        start.setHours(0, 0, 0, 0);
+        const end = new Date(start);
+        end.setDate(end.getDate() + 1);
+
+        const events = await listCalendarEvents(
+          calendar,
+          start.toISOString(),
+          end.toISOString()
+        );
+
+        const assistantText =
+          events.length === 0
+            ? "You have no events tomorrow."
+            : `Here are your events for tomorrow:\n` +
+              events
+                .map((e, i) => `${i + 1}. ${e.summary} (${e.start} → ${e.end})`)
+                .join("\n");
+
+        return res.json({
+          ok: true,
+          build: BUILD,
+          assistantText,
+          functionCalls: [],
+        });
+      }
+    }
+
+    // Otherwise use OpenAI
+    const t0 = Date.now();
+    const { assistantText, raw } = await callOpenAIChat({ userText, messages });
+    const ms = Date.now() - t0;
+
+    // ✅ NEVER return empty assistantText
+    let safeText = (assistantText || "").trim();
+    if (!safeText) {
+      console.log("[chat] OpenAI returned empty content. raw keys:", Object.keys(raw || {}));
+      safeText =
+        "I didn’t get a usable response from the AI. Please try again (or rephrase slightly).";
+    }
+
+    console.log(`[chat] openai ${ms}ms`);
+    console.log("[chat] assistantText length:", safeText.length);
+
+    return res.json({
+      ok: true,
+      build: BUILD,
+      assistantText: safeText,
+      functionCalls: [],
+    });
+  } catch (e) {
+    return jsonError(res, 500, "server_error", e?.message || String(e));
+  }
+});
+
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`mindenu-api listening on :${PORT} (${BUILD})`);
 });
