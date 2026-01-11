@@ -1,92 +1,78 @@
-import fetch from "node-fetch";
+import { getGoogleOAuthClient } from "./providerClients.js";
 import { setProviderTokens } from "./tokenStore.js";
 
-const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
-const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
-
-// Safe default scopes if env var is missing/misconfigured
-const DEFAULT_GOOGLE_SCOPES =
-  "openid email profile " +
-  "https://www.googleapis.com/auth/gmail.readonly " +
-  "https://www.googleapis.com/auth/calendar.events";
-
-export function googleStart(req, res) {
-  const { uid, deep_link } = req.query;
-  if (!uid || !deep_link) return res.status(400).send("Missing uid or deep_link");
-
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
-
-  if (!clientId) return res.status(500).send("Missing GOOGLE_OAUTH_CLIENT_ID");
-  if (!redirectUri) return res.status(500).send("Missing GOOGLE_OAUTH_REDIRECT_URI");
-
-  // If GOOGLE_SCOPES is missing, use defaults. Also trim to avoid blank scopes.
-  const scopes = String(process.env.GOOGLE_SCOPES || DEFAULT_GOOGLE_SCOPES).trim();
-  if (!scopes) return res.status(500).send("Missing GOOGLE_SCOPES (scope cannot be empty)");
-
-  const state = Buffer.from(JSON.stringify({ uid, deep_link })).toString("base64url");
-
-  const url = new URL(GOOGLE_AUTH);
-  url.searchParams.set("client_id", clientId);
-  url.searchParams.set("redirect_uri", redirectUri);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", scopes);
-  url.searchParams.set("access_type", "offline");
-  url.searchParams.set("prompt", "consent");
-  url.searchParams.set("state", state);
-
-  res.redirect(url.toString());
+function requireQuery(req, name) {
+  const v = req.query?.[name];
+  if (!v) throw new Error(`Missing query param: ${name}`);
+  return String(v);
 }
 
-export async function googleCallback(req, res) {
-  try {
-    const { code, state } = req.query;
-    if (!code || !state) return res.status(400).send("Missing code or state");
+export function registerGoogleOAuthRoutes(app) {
+  // Start: /v1/oauth/google/start?uid=...&deep_link=mindenu://oauth-callback
+  app.get("/v1/oauth/google/start", async (req, res) => {
+    try {
+      const uid = requireQuery(req, "uid");
+      const deepLink = requireQuery(req, "deep_link");
 
-    const decoded = JSON.parse(Buffer.from(String(state), "base64url").toString("utf8"));
-    const uid = decoded.uid;
-    const deep_link = decoded.deep_link;
-    if (!uid || !deep_link) return res.status(400).send("Invalid state");
+      const oauth2 = getGoogleOAuthClient();
 
-    const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-    const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+      const scopesRaw =
+        process.env.GOOGLE_SCOPES ||
+        [
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/gmail.send",
+          "https://www.googleapis.com/auth/calendar",
+        ].join(" ");
 
-    if (!clientId) return res.status(500).send("Missing GOOGLE_OAUTH_CLIENT_ID");
-    if (!clientSecret) return res.status(500).send("Missing GOOGLE_OAUTH_CLIENT_SECRET");
-    if (!redirectUri) return res.status(500).send("Missing GOOGLE_OAUTH_REDIRECT_URI");
+      const state = Buffer.from(
+        JSON.stringify({ uid, deep_link: deepLink })
+      ).toString("base64url");
 
-    const body = new URLSearchParams();
-    body.set("code", String(code));
-    body.set("client_id", clientId);
-    body.set("client_secret", clientSecret);
-    body.set("redirect_uri", redirectUri);
-    body.set("grant_type", "authorization_code");
+      const url = oauth2.generateAuthUrl({
+        access_type: "offline",
+        prompt: "consent",
+        scope: scopesRaw.split(/[,\s]+/).filter(Boolean),
+        state,
+      });
 
-    const r = await fetch(GOOGLE_TOKEN, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
-    });
-
-    const j = await r.json();
-    if (!r.ok) {
-      return res.status(400).send(`Token exchange failed: ${JSON.stringify(j)}`);
+      return res.redirect(url);
+    } catch (e) {
+      return res
+        .status(400)
+        .send(`Google OAuth start error: ${String(e?.message || e)}`);
     }
+  });
 
-    setProviderTokens(uid, "google", {
-      access_token: j.access_token,
-      refresh_token: j.refresh_token,
-      expires_in: j.expires_in,
-      scope: j.scope,
-      token_type: j.token_type,
-    });
+  // Callback must match your Google Cloud "Authorized redirect URIs"
+  app.get("/v1/oauth/google/callback", async (req, res) => {
+    try {
+      const code = String(req.query?.code || "");
+      const stateB64 = String(req.query?.state || "");
+      if (!code) return res.status(400).send("Missing code");
+      if (!stateB64) return res.status(400).send("Missing state");
 
-    const dl = new URL(String(deep_link));
-    dl.searchParams.set("provider", "google");
-    dl.searchParams.set("status", "connected");
-    res.redirect(dl.toString());
-  } catch (err) {
-    res.status(500).send(err?.message || String(err));
-  }
+      const state = JSON.parse(Buffer.from(stateB64, "base64url").toString("utf8"));
+      const { uid, deep_link } = state;
+
+      const oauth2 = getGoogleOAuthClient();
+      const { tokens } = await oauth2.getToken(code);
+
+      // Ensure refresh_token exists (prompt=consent helps)
+      await setProviderTokens(uid, "google", {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        scope: tokens.scope,
+        token_type: tokens.token_type,
+        expiry_date: tokens.expiry_date,
+      });
+
+      // Redirect back to iOS deep link
+      const callback = `${deep_link}?provider=google&status=connected`;
+      return res.redirect(callback);
+    } catch (e) {
+      return res
+        .status(500)
+        .send(`Google OAuth callback error: ${String(e?.message || e)}`);
+    }
+  });
 }
