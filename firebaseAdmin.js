@@ -1,36 +1,34 @@
-// firebaseAdmin.js (ESM)
+// backend-node/firebaseAdmin.js
 import admin from "firebase-admin";
+
+/**
+ * Render env var required:
+ *   FIREBASE_SERVICE_ACCOUNT_JSON = { ...entire service account json... }
+ *
+ * Optional (if you want to hard-force project id):
+ *   FIREBASE_PROJECT_ID = mindenu-7d3ba
+ */
 
 function parseServiceAccountFromEnv() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-
-  if (!raw || !raw.trim()) {
+  if (!raw) {
     throw new Error(
       "[firebaseAdmin] Missing FIREBASE_SERVICE_ACCOUNT_JSON env var. Paste the entire service account JSON into Render Environment."
     );
   }
 
-  let obj;
   try {
-    obj = JSON.parse(raw);
+    // Render sometimes escapes newlines; normalize private_key
+    const obj = JSON.parse(raw);
+    if (obj.private_key && typeof obj.private_key === "string") {
+      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
+    }
+    return obj;
   } catch (e) {
     throw new Error(
-      `[firebaseAdmin] FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON. Error: ${e?.message || e}`
+      `[firebaseAdmin] FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: ${e?.message || e}`
     );
   }
-
-  // Handle cases where private_key newlines were escaped
-  if (typeof obj.private_key === "string") {
-    obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-  }
-
-  if (!obj.client_email || !obj.private_key || !obj.project_id) {
-    throw new Error(
-      "[firebaseAdmin] Service account JSON missing required fields (client_email/private_key/project_id)."
-    );
-  }
-
-  return obj;
 }
 
 function initAdmin() {
@@ -40,6 +38,7 @@ function initAdmin() {
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
+    projectId: process.env.FIREBASE_PROJECT_ID || serviceAccount.project_id,
   });
 
   console.log(

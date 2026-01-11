@@ -1,86 +1,100 @@
-// providerClients.js (ESM)
+// backend-node/providerClients.js
 import { google } from "googleapis";
 import firebaseAdmin from "./firebaseAdmin.js";
 
 const db = firebaseAdmin.firestore();
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`[env] Missing ${name}`);
-  return v;
-}
+/**
+ * REQUIRED env vars in Render:
+ *   GOOGLE_OAUTH_CLIENT_ID
+ *   GOOGLE_OAUTH_CLIENT_SECRET
+ *   GOOGLE_OAUTH_REDIRECT_URI   (must match what’s in Google Cloud console)
+ *
+ * Optional:
+ *   APP_OAUTH_SUCCESS_REDIRECT  (where to send user after Google callback)
+ *     Example for iOS custom scheme:
+ *       mindenu://oauth/google?ok=1
+ *     Or a web page:
+ *       https://your-site.com/oauth/success
+ */
 
-// Google OAuth env vars (Render)
-const GOOGLE_OAUTH_CLIENT_ID = requireEnv("GOOGLE_OAUTH_CLIENT_ID");
-const GOOGLE_OAUTH_CLIENT_SECRET = requireEnv("GOOGLE_OAUTH_CLIENT_SECRET");
-const GOOGLE_OAUTH_REDIRECT_URI = requireEnv("GOOGLE_OAUTH_REDIRECT_URI");
+export function makeGoogleOAuthClient() {
+  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
 
-// Store tokens here:
-// users/{uid}/providers/google
-function googleTokenDocRef(uid) {
-  return db.collection("users").doc(uid).collection("providers").doc("google");
-}
-
-export async function verifyFirebaseBearer(req) {
-  const auth = req.headers.authorization || "";
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) {
-    const err = new Error("missing_authorization");
-    err.status = 401;
-    throw err;
+  if (!clientId || !clientSecret || !redirectUri) {
+    throw new Error(
+      "[google] Missing GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REDIRECT_URI in environment"
+    );
   }
 
-  const idToken = m[1];
-  try {
-    const decoded = await firebaseAdmin.auth().verifyIdToken(idToken);
-    return { uid: decoded.uid, decoded, idToken };
-  } catch (e) {
-    const err = new Error("invalid_id_token");
-    err.status = 401;
-    err.details = e?.message || String(e);
-    throw err;
-  }
+  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 }
 
-export async function getGoogleTokens(uid) {
-  const snap = await googleTokenDocRef(uid).get();
+/**
+ * Save provider tokens in Firestore
+ * Path:
+ *   users/{uid}/providers/google
+ */
+export async function saveGoogleTokensForUid(uid, tokens) {
+  await db
+    .collection("users")
+    .doc(uid)
+    .collection("providers")
+    .doc("google")
+    .set(
+      {
+        tokens,
+        updatedAt: firebaseAdmin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+}
+
+export async function getGoogleTokensForUid(uid) {
+  const snap = await db
+    .collection("users")
+    .doc(uid)
+    .collection("providers")
+    .doc("google")
+    .get();
+
   if (!snap.exists) return null;
-  return snap.data() || null;
+  const data = snap.data();
+  return data?.tokens || null;
 }
 
-export async function saveGoogleTokens(uid, tokens) {
-  // tokens = { access_token, refresh_token, scope, token_type, expiry_date }
-  await googleTokenDocRef(uid).set(
-    {
-      ...tokens,
-      updatedAt: firebaseAdmin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
-
-export function buildGoogleOAuthClient() {
-  return new google.auth.OAuth2(
-    GOOGLE_OAUTH_CLIENT_ID,
-    GOOGLE_OAUTH_CLIENT_SECRET,
-    GOOGLE_OAUTH_REDIRECT_URI
-  );
-}
-
-export async function getGoogleCalendarClientForUid(uid) {
-  const tokens = await getGoogleTokens(uid);
+/**
+ * Create an authenticated Google client from stored tokens.
+ */
+export async function getAuthedGoogleClientForUid(uid) {
+  const tokens = await getGoogleTokensForUid(uid);
   if (!tokens) return null;
 
-  const oauth2 = buildGoogleOAuthClient();
+  const oauth2 = makeGoogleOAuthClient();
   oauth2.setCredentials(tokens);
 
-  // If token expired but refresh_token exists, googleapis will auto-refresh.
-  // We should listen and persist refreshed tokens.
-  oauth2.on("tokens", async (newTokens) => {
-    if (!newTokens) return;
-    // Merge with existing to retain refresh_token if not included every time
-    await saveGoogleTokens(uid, { ...tokens, ...newTokens });
-  });
+  return oauth2;
+}
 
-  return google.calendar({ version: "v3", auth: oauth2 });
+/**
+ * Short-lived "state" storage so callback can map back to uid.
+ * Path:
+ *   oauthStates/{state}
+ */
+export async function createOAuthState(uid, state) {
+  await db.collection("oauthStates").doc(state).set({
+    uid,
+    createdAt: firebaseAdmin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+export async function consumeOAuthState(state) {
+  const ref = db.collection("oauthStates").doc(state);
+  const snap = await ref.get();
+  if (!snap.exists) return null;
+  const { uid } = snap.data() || {};
+  await ref.delete();
+  return uid || null;
 }
