@@ -1,54 +1,34 @@
-// backend-node/firebaseAdmin.js
+// firebaseAdmin.js
 import admin from "firebase-admin";
 
-/**
- * Render env var required:
- *   FIREBASE_SERVICE_ACCOUNT_JSON = { ...entire service account json... }
- *
- * Optional (if you want to hard-force project id):
- *   FIREBASE_PROJECT_ID = mindenu-7d3ba
- */
-
-function parseServiceAccountFromEnv() {
+if (!admin.apps.length) {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
   if (!raw) {
     throw new Error(
-      "[firebaseAdmin] Missing FIREBASE_SERVICE_ACCOUNT_JSON env var. Paste the entire service account JSON into Render Environment."
+      "Missing FIREBASE_SERVICE_ACCOUNT_JSON in environment. Add it in Render -> Environment."
     );
   }
 
+  let serviceAccount;
   try {
-    // Render sometimes escapes newlines; normalize private_key
-    const obj = JSON.parse(raw);
-    if (obj.private_key && typeof obj.private_key === "string") {
-      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-    }
-    return obj;
+    serviceAccount = JSON.parse(raw);
   } catch (e) {
     throw new Error(
-      `[firebaseAdmin] FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: ${e?.message || e}`
+      "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON. Re-paste the ENTIRE JSON exactly as downloaded."
     );
   }
-}
 
-function initAdmin() {
-  if (admin.apps.length) return admin;
-
-  const serviceAccount = parseServiceAccountFromEnv();
+  // Important: Render sometimes stores actual newlines; Firebase expects \n inside private_key
+  if (serviceAccount.private_key && serviceAccount.private_key.includes("\\n")) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+  }
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    projectId: process.env.FIREBASE_PROJECT_ID || serviceAccount.project_id,
   });
 
-  console.log(
-    "[firebaseAdmin] initialized with service account:",
-    serviceAccount.project_id
-  );
-  console.log("[firebaseAdmin] client_email:", serviceAccount.client_email);
-
-  return admin;
+  console.log("[firebaseAdmin] initialized with service account:", serviceAccount.project_id);
 }
 
-export const firebaseAdmin = initAdmin();
-export default firebaseAdmin;
+export default admin;
