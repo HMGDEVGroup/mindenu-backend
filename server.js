@@ -1,3 +1,4 @@
+// backend-node/server.js
 import "dotenv/config";
 import "./firebaseAdmin.js";
 
@@ -15,35 +16,49 @@ import {
   googleDeleteCalendarEvent, // ✅ NEW
   googleFetchGmailUnread,
   googleSendEmail,
-  // If you still have Microsoft wired, leave these imports as your baseline already had:
   msFetchCalendarEvents,
   msCreateCalendarEvent,
+  msDeleteCalendarEvent, // ✅ NEW
   msFetchMailUnread,
   msSendEmail,
 } from "./providerClients.js";
 
 import { callOpenAI } from "./openaiClient.js";
 
-const BUILD = "server.js-v8-google-only-delete-event";
+const BUILD = "server.js-v7-add-delete-calendar-events";
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-app.get("/health", (_req, res) => res.json({ ok: true, build: BUILD }));
-
+/**
+ * --------------------
+ * Health
+ * --------------------
+ */
 app.get("/", (_req, res) => {
-  res.status(200).send(`Mindenu API is running. Try /health or /v1/chat. Build: ${BUILD}`);
+  // So the Render "web page" doesn't show Cannot GET /
+  res.status(200).send("mindenu-api OK");
 });
 
-// OAuth
+app.get("/health", (_req, res) => res.json({ ok: true, build: BUILD }));
+
+/**
+ * --------------------
+ * OAuth routes
+ * --------------------
+ */
 app.get("/v1/oauth/google/start", googleStart);
 app.get("/v1/oauth/google/callback", googleCallback);
 
 app.get("/v1/oauth/microsoft/start", microsoftStart);
 app.get("/v1/oauth/microsoft/callback", microsoftCallback);
 
-// Status
+/**
+ * --------------------
+ * Connection status
+ * --------------------
+ */
 app.get("/v1/oauth/status", requireAuth, (req, res) => {
   const uid = req.user.uid;
   const google = getProviderTokens(uid, "google") != null;
@@ -51,48 +66,164 @@ app.get("/v1/oauth/status", requireAuth, (req, res) => {
   res.json({ ok: true, google, microsoft });
 });
 
-// --------------------
-// /v1/chat (LEAVE AS YOUR WORKING BASELINE LOGIC)
-// --------------------
+/**
+ * --------------------
+ * Helpers (Responses API extraction)
+ * --------------------
+ */
+function extractAssistantText(openaiResponse) {
+  try {
+    const output = openaiResponse?.output;
+    if (!Array.isArray(output)) return "";
+
+    const chunks = [];
+    for (const item of output) {
+      if (item?.type === "message" && item?.role === "assistant" && Array.isArray(item?.content)) {
+        for (const c of item.content) {
+          if (c?.type === "output_text" && typeof c?.text === "string") chunks.push(c.text);
+          if (c?.type === "refusal" && typeof c?.refusal === "string") chunks.push(c.refusal);
+        }
+      }
+    }
+    return chunks.join("\n").trim();
+  } catch {
+    return "";
+  }
+}
+
+function extractFunctionCalls(openaiResponse) {
+  try {
+    const output = openaiResponse?.output;
+    if (!Array.isArray(output)) return [];
+
+    const calls = [];
+    for (const item of output) {
+      if (item?.type === "function_call") {
+        calls.push({
+          name: item?.name,
+          arguments: item?.arguments,
+        });
+      }
+    }
+    return calls;
+  } catch {
+    return [];
+  }
+}
+
+function toResponsesContentParts(role, text) {
+  const safeText = String(text ?? "");
+  if (role === "assistant") return [{ type: "output_text", text: safeText }];
+  return [{ type: "input_text", text: safeText }];
+}
+
+/**
+ * --------------------
+ * Simple in-memory cache to speed provider fetch
+ * (uid+provider -> cached data for N seconds)
+ * --------------------
+ */
+const providerCache = new Map();
+// key: `${uid}:${provider}` -> { ts, calendarEvents, unreadEmail }
+const CACHE_TTL_MS = Number(process.env.PROVIDER_CACHE_TTL_MS ?? 15_000);
+
+function cacheKey(uid, provider) {
+  return `${uid}:${provider}`;
+}
+
+function getCache(uid, provider) {
+  const k = cacheKey(uid, provider);
+  const v = providerCache.get(k);
+  if (!v) return null;
+  if (Date.now() - v.ts > CACHE_TTL_MS) {
+    providerCache.delete(k);
+    return null;
+  }
+  return v;
+}
+
+function setCache(uid, provider, calendarEvents, unreadEmail) {
+  providerCache.set(cacheKey(uid, provider), {
+    ts: Date.now(),
+    calendarEvents,
+    unreadEmail,
+  });
+}
+
+/**
+ * --------------------
+ * Chat endpoint
+ * --------------------
+ */
 app.post("/v1/chat", requireAuth, async (req, res) => {
+  const t0 = Date.now();
+
   try {
     const uid = req.user.uid;
     const { messages } = req.body || {};
 
     if (!Array.isArray(messages)) {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "messages must be an array" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "bad_request", details: "messages must be an array" });
     }
 
+    // Provider choice
     const googleTokens = getProviderTokens(uid, "google");
     const msTokens = getProviderTokens(uid, "microsoft");
 
     let provider = null;
+    if (googleTokens?.access_token) provider = "google";
+    else if (msTokens?.access_token) provider = "microsoft";
+
+    // Fetch provider context (cached)
     let calendarEvents = [];
     let unreadEmail = [];
+    let cacheFresh = false;
 
-    if (googleTokens?.access_token) {
-      provider = "google";
-      try { calendarEvents = await googleFetchCalendarEvents(googleTokens.access_token); } catch {}
-      try { unreadEmail = await googleFetchGmailUnread(googleTokens.access_token); } catch {}
-    } else if (msTokens?.access_token) {
-      provider = "microsoft";
-      try { calendarEvents = await msFetchCalendarEvents(msTokens.access_token); } catch {}
-      try { unreadEmail = await msFetchMailUnread(msTokens.access_token); } catch {}
+    if (provider) {
+      const cached = getCache(uid, provider);
+      if (cached) {
+        calendarEvents = cached.calendarEvents;
+        unreadEmail = cached.unreadEmail;
+        cacheFresh = true;
+      } else {
+        const tfetch0 = Date.now();
+        try {
+          if (provider === "google") {
+            calendarEvents = await googleFetchCalendarEvents(googleTokens.access_token, { days: 3, maxResults: 25 });
+            unreadEmail = await googleFetchGmailUnread(googleTokens.access_token, { max: 3 });
+          } else {
+            calendarEvents = await msFetchCalendarEvents(msTokens.access_token, { days: 3 });
+            unreadEmail = await msFetchMailUnread(msTokens.access_token, { max: 3 });
+          }
+        } catch {
+          calendarEvents = [];
+          unreadEmail = [];
+        }
+        setCache(uid, provider, calendarEvents, unreadEmail);
+        console.log(`[chat] providerFetch cacheFresh=false provider=${provider} ${Date.now() - tfetch0}ms`);
+      }
     }
 
+    if (provider && cacheFresh) {
+      console.log(`[chat] providerFetch cacheFresh=true provider=${provider} 0ms`);
+    }
+
+    // ✅ Tools (TOP-LEVEL name/description/parameters)
     const tools = [
       {
         type: "function",
         name: "propose_calendar_event",
-        description: "Propose a calendar event for user confirmation before creating it.",
+        description: "Propose a calendar event for user confirmation before creating it. Do NOT create it directly.",
         parameters: {
           type: "object",
           additionalProperties: false,
           properties: {
             provider: { type: "string", enum: ["google", "microsoft"] },
             title: { type: "string" },
-            startISO: { type: "string" },
-            endISO: { type: "string" },
+            startISO: { type: "string", description: "ISO 8601 date-time string" },
+            endISO: { type: "string", description: "ISO 8601 date-time string" },
             description: { type: "string" },
             location: { type: "string" },
             attendees: { type: "array", items: { type: "string" } },
@@ -103,7 +234,7 @@ app.post("/v1/chat", requireAuth, async (req, res) => {
       {
         type: "function",
         name: "propose_email",
-        description: "Propose an email draft for user confirmation before sending it.",
+        description: "Propose an email draft for user confirmation before sending it. Do NOT send it directly.",
         parameters: {
           type: "object",
           additionalProperties: false,
@@ -116,129 +247,236 @@ app.post("/v1/chat", requireAuth, async (req, res) => {
           required: ["provider", "to", "subject", "bodyText"],
         },
       },
-      // NOTE: we are NOT adding tool logic here for delete.
-      // Deletion is done via /v1/actions/delete-event after user confirms in the UI.
+      // ✅ NEW: propose delete calendar event
+      {
+        type: "function",
+        name: "propose_delete_calendar_event",
+        description:
+          "Propose deleting a calendar event for user confirmation. Do NOT delete it directly. Include eventId and title and startISO if possible.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            provider: { type: "string", enum: ["google", "microsoft"] },
+            eventId: { type: "string", description: "Calendar provider event ID" },
+            title: { type: "string" },
+            startISO: { type: "string", description: "ISO 8601 start time if known" },
+          },
+          required: ["provider", "eventId"],
+        },
+      },
     ];
 
     const systemMsg = [
       "You are Mindenu, a helpful personal assistant.",
-      "NEVER send email or create or delete calendar events without explicit user confirmation.",
+      "You can summarize email and calendar, draft replies, and propose actions.",
+      "",
+      "Hard rules:",
+      "1) NEVER send an email without explicit user confirmation.",
+      "2) NEVER create a calendar event without explicit user confirmation.",
+      "3) NEVER delete a calendar event without explicit user confirmation.",
+      "",
+      "Confirm phrases:",
+      '- To send an email: user says exactly "Send it".',
+      '- To create an event: user says exactly "Create it".',
+      '- To delete an event: user says exactly "Delete it".',
       "",
       `Connected provider: ${provider ?? "none"}`,
       "",
-      "Calendar events (recent/upcoming):",
+      "Calendar events (next 3 days):",
       JSON.stringify(calendarEvents ?? [], null, 2),
       "",
-      "Unread email (recent):",
+      "Unread email (last 3):",
       JSON.stringify(unreadEmail ?? [], null, 2),
+      "",
+      "Important:",
+      "If the user asks to delete an event, ALWAYS propose using propose_delete_calendar_event and include the correct eventId from the calendar list when possible.",
     ].join("\n");
 
     const openaiInput = [
-      { role: "system", content: [{ type: "input_text", text: systemMsg }] },
+      { role: "system", content: toResponsesContentParts("system", systemMsg) },
       ...messages.map((m) => ({
         role: m.role,
-        content: [{ type: "input_text", text: String(m.text ?? "") }],
+        content: toResponsesContentParts(m.role, m.text),
       })),
     ];
 
-    const out = await callOpenAI({ input: openaiInput, tools });
+    const tOpenAI0 = Date.now();
+    const out = await callOpenAI({
+      input: openaiInput,
+      tools,
+    });
+    console.log(`[chat] openai ${Date.now() - tOpenAI0}ms total=${Date.now() - t0}ms`);
 
-    res.json({ ok: true, openai: out });
+    const assistantText = extractAssistantText(out);
+    const functionCalls = extractFunctionCalls(out);
+
+    console.log(`[chat] assistantText length: ${assistantText?.length ?? 0}`);
+    console.log(`[chat] assistantText preview: ${(assistantText ?? "").slice(0, 220).replace(/\s+/g, " ")}`);
+    console.log(`[chat] functionCalls count: ${functionCalls.length}`);
+
+    res.json({
+      ok: true,
+      assistantText,
+      functionCalls,
+    });
   } catch (err) {
-    res.status(500).json({ ok: false, error: "server_error", details: err?.message || String(err) });
+    res.status(500).json({
+      ok: false,
+      error: "server_error",
+      details: err?.message || String(err),
+      build: BUILD,
+    });
   }
 });
 
-// --------------------
-// Actions (existing)
-// --------------------
+/**
+ * --------------------
+ * Actions (execute only after user confirmation)
+ * --------------------
+ */
+
+// Create calendar event (after user confirms)
 app.post("/v1/actions/create-event", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
     const { provider, title, startISO, endISO, description, location, attendees } = req.body || {};
 
     if (!provider || !title || !startISO || !endISO) {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "provider, title, startISO, endISO are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "bad_request",
+        details: "provider, title, startISO, endISO are required",
+      });
     }
 
     const tokens = getProviderTokens(uid, provider);
     if (!tokens?.access_token) {
-      return res.status(400).json({ ok: false, error: "not_connected", details: `No access token for provider: ${provider}` });
+      return res.status(400).json({
+        ok: false,
+        error: "not_connected",
+        details: `No access token found for provider: ${provider}`,
+      });
     }
 
     const payload = { title, startISO, endISO, description, location, attendees };
 
     let result;
-    if (provider === "google") result = await googleCreateCalendarEvent(tokens.access_token, payload);
-    else if (provider === "microsoft") result = await msCreateCalendarEvent(tokens.access_token, payload);
-    else return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
+    if (provider === "google") {
+      result = await googleCreateCalendarEvent(tokens.access_token, payload);
+    } else if (provider === "microsoft") {
+      result = await msCreateCalendarEvent(tokens.access_token, payload);
+    } else {
+      return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
+    }
 
-    res.json({ ok: true, provider, result });
+    // cache refresh
+    providerCache.delete(cacheKey(uid, provider));
+
+    res.json({ ok: true, provider, result, build: BUILD });
   } catch (err) {
-    res.status(500).json({ ok: false, error: "create_event_failed", details: err?.message || String(err) });
+    res.status(500).json({
+      ok: false,
+      error: "create_event_failed",
+      details: err?.message || String(err),
+      build: BUILD,
+    });
   }
 });
 
+// ✅ NEW: Delete calendar event (after user confirms)
+app.post("/v1/actions/delete-event", requireAuth, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { provider, eventId } = req.body || {};
+
+    if (!provider || !eventId) {
+      return res.status(400).json({
+        ok: false,
+        error: "bad_request",
+        details: "provider and eventId are required",
+      });
+    }
+
+    const tokens = getProviderTokens(uid, provider);
+    if (!tokens?.access_token) {
+      return res.status(400).json({
+        ok: false,
+        error: "not_connected",
+        details: `No access token found for provider: ${provider}`,
+      });
+    }
+
+    let result;
+    if (provider === "google") {
+      result = await googleDeleteCalendarEvent(tokens.access_token, eventId);
+    } else if (provider === "microsoft") {
+      result = await msDeleteCalendarEvent(tokens.access_token, eventId);
+    } else {
+      return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
+    }
+
+    // cache refresh
+    providerCache.delete(cacheKey(uid, provider));
+
+    res.json({ ok: true, provider, result, build: BUILD });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: "delete_event_failed",
+      details: err?.message || String(err),
+      build: BUILD,
+    });
+  }
+});
+
+// Send email (after user confirms)
 app.post("/v1/actions/send-email", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
     const { provider, to, subject, bodyText } = req.body || {};
 
     if (!provider || !to || !subject || !bodyText) {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "provider, to, subject, bodyText are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "bad_request",
+        details: "provider, to, subject, bodyText are required",
+      });
     }
 
     const tokens = getProviderTokens(uid, provider);
     if (!tokens?.access_token) {
-      return res.status(400).json({ ok: false, error: "not_connected", details: `No access token for provider: ${provider}` });
+      return res.status(400).json({
+        ok: false,
+        error: "not_connected",
+        details: `No access token found for provider: ${provider}`,
+      });
     }
 
     const payload = { to, subject, bodyText };
 
     let result;
-    if (provider === "google") result = await googleSendEmail(tokens.access_token, payload);
-    else if (provider === "microsoft") result = await msSendEmail(tokens.access_token, payload);
-    else return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
+    if (provider === "google") {
+      result = await googleSendEmail(tokens.access_token, payload);
+    } else if (provider === "microsoft") {
+      result = await msSendEmail(tokens.access_token, payload);
+    } else {
+      return res.status(400).json({ ok: false, error: "bad_request", details: "Unknown provider" });
+    }
 
-    res.json({ ok: true, provider, result });
+    res.json({ ok: true, provider, result, build: BUILD });
   } catch (err) {
-    res.status(500).json({ ok: false, error: "send_email_failed", details: err?.message || String(err) });
+    res.status(500).json({
+      ok: false,
+      error: "send_email_failed",
+      details: err?.message || String(err),
+      build: BUILD,
+    });
   }
 });
 
-// --------------------
-// ✅ NEW: Google-only delete endpoint
-// --------------------
-app.post("/v1/actions/delete-event", requireAuth, async (req, res) => {
-  try {
-    const uid = req.user.uid;
-
-    // Accept both:
-    // - { eventId: "..." }   (Google-only)
-    // - { provider:"google", eventId:"..." } (if your app already sends provider)
-    const { provider, eventId } = req.body || {};
-    const p = provider || "google";
-
-    if (p !== "google") {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "This backend is configured for Google-only deletes." });
-    }
-    if (!eventId) {
-      return res.status(400).json({ ok: false, error: "bad_request", details: "eventId is required" });
-    }
-
-    const tokens = getProviderTokens(uid, "google");
-    if (!tokens?.access_token) {
-      return res.status(400).json({ ok: false, error: "not_connected", details: "No Google access token found for this user." });
-    }
-
-    const result = await googleDeleteCalendarEvent(tokens.access_token, eventId);
-
-    res.json({ ok: true, provider: "google", result });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: "delete_event_failed", details: err?.message || String(err) });
-  }
-});
-
-// --------------------
+/**
+ * --------------------
+ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`mindenu-api listening on :${PORT} (${BUILD})`));
