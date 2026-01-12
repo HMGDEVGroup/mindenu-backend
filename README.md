@@ -23,4 +23,3 @@ that your iOS app calls. The iOS app never receives these secrets.
 - Token storage in this starter kit is **in-memory** for clarity. Replace `tokenStore.js` with a real DB
   (Postgres, Redis, etc.) and encrypt refresh tokens.
 - OAuth is implemented as a **backend redirect** flow (start -> provider -> callback -> deep link back to app).
-# mindenu-backend

@@ -1,78 +1,67 @@
-import { getGoogleOAuthClient } from "./providerClients.js";
+import fetch from "node-fetch";
 import { setProviderTokens } from "./tokenStore.js";
 
-function requireQuery(req, name) {
-  const v = req.query?.[name];
-  if (!v) throw new Error(`Missing query param: ${name}`);
-  return String(v);
+const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
+
+/**
+ * Backend OAuth (web application client). iOS hits /start; user consents in browser; callback exchanges code using client secret.
+ * Native apps can't keep secrets; this backend flow keeps the secret on server.
+ *
+ * Docs: https://developers.google.com/identity/protocols/oauth2/native-app
+ */
+export function googleStart(req, res) {
+  const { uid, deep_link } = req.query;
+  if (!uid || !deep_link) return res.status(400).send("Missing uid or deep_link");
+
+  const state = Buffer.from(JSON.stringify({ uid, deep_link })).toString("base64url");
+
+  const url = new URL(GOOGLE_AUTH);
+  url.searchParams.set("client_id", process.env.GOOGLE_OAUTH_CLIENT_ID);
+  url.searchParams.set("redirect_uri", process.env.GOOGLE_OAUTH_REDIRECT_URI);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", process.env.GOOGLE_SCOPES || "");
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("prompt", "consent");
+  url.searchParams.set("state", state);
+
+  res.redirect(url.toString());
 }
 
-export function registerGoogleOAuthRoutes(app) {
-  // Start: /v1/oauth/google/start?uid=...&deep_link=mindenu://oauth-callback
-  app.get("/v1/oauth/google/start", async (req, res) => {
-    try {
-      const uid = requireQuery(req, "uid");
-      const deepLink = requireQuery(req, "deep_link");
+export async function googleCallback(req, res) {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send("Missing code/state");
 
-      const oauth2 = getGoogleOAuthClient();
+  const { uid, deep_link } = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
 
-      const scopesRaw =
-        process.env.GOOGLE_SCOPES ||
-        [
-          "https://www.googleapis.com/auth/gmail.readonly",
-          "https://www.googleapis.com/auth/gmail.send",
-          "https://www.googleapis.com/auth/calendar",
-        ].join(" ");
-
-      const state = Buffer.from(
-        JSON.stringify({ uid, deep_link: deepLink })
-      ).toString("base64url");
-
-      const url = oauth2.generateAuthUrl({
-        access_type: "offline",
-        prompt: "consent",
-        scope: scopesRaw.split(/[,\s]+/).filter(Boolean),
-        state,
-      });
-
-      return res.redirect(url);
-    } catch (e) {
-      return res
-        .status(400)
-        .send(`Google OAuth start error: ${String(e?.message || e)}`);
-    }
+  // Exchange code for tokens
+  const body = new URLSearchParams({
+    code: String(code),
+    client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
+    client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+    redirect_uri: process.env.GOOGLE_OAUTH_REDIRECT_URI,
+    grant_type: "authorization_code",
   });
 
-  // Callback must match your Google Cloud "Authorized redirect URIs"
-  app.get("/v1/oauth/google/callback", async (req, res) => {
-    try {
-      const code = String(req.query?.code || "");
-      const stateB64 = String(req.query?.state || "");
-      if (!code) return res.status(400).send("Missing code");
-      if (!stateB64) return res.status(400).send("Missing state");
-
-      const state = JSON.parse(Buffer.from(stateB64, "base64url").toString("utf8"));
-      const { uid, deep_link } = state;
-
-      const oauth2 = getGoogleOAuthClient();
-      const { tokens } = await oauth2.getToken(code);
-
-      // Ensure refresh_token exists (prompt=consent helps)
-      await setProviderTokens(uid, "google", {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        scope: tokens.scope,
-        token_type: tokens.token_type,
-        expiry_date: tokens.expiry_date,
-      });
-
-      // Redirect back to iOS deep link
-      const callback = `${deep_link}?provider=google&status=connected`;
-      return res.redirect(callback);
-    } catch (e) {
-      return res
-        .status(500)
-        .send(`Google OAuth callback error: ${String(e?.message || e)}`);
-    }
+  const r = await fetch(GOOGLE_TOKEN, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
   });
+  const j = await r.json();
+  if (!r.ok) return res.status(400).send(`Token exchange failed: ${j?.error_description || j?.error || r.statusText}`);
+
+  setProviderTokens(uid, "google", {
+    access_token: j.access_token,
+    refresh_token: j.refresh_token,
+    expires_in: j.expires_in,
+    scope: j.scope,
+    token_type: j.token_type,
+  });
+
+  // Deep link back to app
+  const dl = new URL(String(deep_link));
+  dl.searchParams.set("provider", "google");
+  dl.searchParams.set("status", "connected");
+  res.redirect(dl.toString());
 }
